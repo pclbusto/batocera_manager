@@ -1,0 +1,13 @@
+[package]
+name = "batocera_manager"
+version = "0.0.1"
+edition = "2024"
+
+[dependencies]
+libcosmic = { git = "https://github.com/pop-os/libcosmic.git", features = ["about"] }
+open = "5.3"
+rfd = "0.15"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "process"] }
+rusqlite = { version = "0.33", features = ["bundled"] }
+blake3 = "1.5"
+ssh2 = "0.9"
