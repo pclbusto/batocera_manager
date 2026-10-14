@@ -5,39 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-#[derive(Clone, Debug)]
-pub struct SystemConfig {
-    pub id: String,
-    pub name: String,
-    pub local_folder: PathBuf,
-    pub local_folder_str: String,
-    pub remote_folder: String,
-    pub enabled: bool,
-    pub local_rom_count: usize,
-    #[allow(dead_code)]
-    pub remote_rom_count: usize,
-    pub status_msg: String,
-}
-
-impl SystemConfig {
-    pub fn new(id: &str, name: &str, base_roms: &Path, enabled: bool) -> Self {
-        let folder = base_roms.join(id);
-        let folder_str = folder.display().to_string();
-        let local_count = count_files_in_dir(&folder);
-
-        Self {
-            id: id.to_string(),
-            name: name.to_string(),
-            local_folder: folder,
-            local_folder_str: folder_str,
-            remote_folder: format!("roms/{id}"),
-            enabled,
-            local_rom_count: local_count,
-            remote_rom_count: 0,
-            status_msg: "Sin escanear".to_string(),
-        }
-    }
-}
+pub use crate::domain::system::SystemConfig;
 
 pub fn count_files_in_dir(dir: &Path) -> usize {
     if !dir.exists() || !dir.is_dir() {
@@ -59,7 +27,7 @@ pub fn count_files_in_dir(dir: &Path) -> usize {
 
 /// Lista de sistemas predeterminados populares en Batocera / Anbernic
 pub fn default_systems_list(base_roms: &Path) -> Vec<SystemConfig> {
-    vec![
+    let mut list = vec![
         SystemConfig::new("psx", "Sony PlayStation (PS1)", base_roms, true),
         SystemConfig::new("snes", "Super Nintendo (SNES)", base_roms, true),
         SystemConfig::new("gba", "Nintendo Game Boy Advance", base_roms, true),
@@ -74,7 +42,11 @@ pub fn default_systems_list(base_roms: &Path) -> Vec<SystemConfig> {
         SystemConfig::new("neogeo", "SNK Neo Geo", base_roms, false),
         SystemConfig::new("saturn", "Sega Saturn", base_roms, false),
         SystemConfig::new("dreamcast", "Sega Dreamcast", base_roms, false),
-    ]
+    ];
+    for sys in &mut list {
+        sys.local_rom_count = count_files_in_dir(&sys.local_folder);
+    }
+    list
 }
 
 fn scan_local(root: &Path, cur: &Path, list: &mut Vec<(String, PathBuf, u64)>) {
@@ -198,31 +170,8 @@ pub fn sync_system(
     ))
 }
 
-#[derive(Clone, Debug)]
-pub struct GameItem {
-    pub filename: String,
-    pub path: PathBuf,
-    pub size_bytes: u64,
-    pub size_formatted: String,
-    pub exists_on_console: bool,
-    pub selected: bool,
-}
+pub use crate::domain::game::{format_size, GameItem};
 
-pub fn format_size(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    const GB: u64 = MB * 1024;
-
-    if bytes >= GB {
-        format!("{:.2} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.1} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.0} KB", bytes as f64 / KB as f64)
-    } else {
-        format!("{bytes} B")
-    }
-}
 
 pub fn scan_games_for_system(local_folder: &Path, remote_names: &[String]) -> Vec<GameItem> {
     let mut games = Vec::new();

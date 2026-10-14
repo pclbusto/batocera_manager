@@ -1,53 +1,10 @@
-use crate::net::{self, DiskSpace};
+use crate::net;
 use crate::systems::{format_size, SystemConfig};
 use ssh2::{Session, Sftp};
 use std::path::Path;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum WasteType {
-    ZeroByteRom,
-    PartialTransferPart,
-}
-
-impl WasteType {
-    pub fn description(&self) -> &'static str {
-        match self {
-            WasteType::ZeroByteRom => "Archivo ROM de 0 bytes (corrupto/incompleto)",
-            WasteType::PartialTransferPart => "Archivo temporal .part de transferencia interrumpida",
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct WasteCandidate {
-    pub relative_path: String,
-    pub full_remote_path: String,
-    pub size_bytes: u64,
-    pub mtime: u64,
-    pub waste_type: WasteType,
-    pub system_id: String,
-    pub selected: bool,
-}
-
-#[derive(Clone, Debug)]
-pub struct SystemUsage {
-    pub system_id: String,
-    pub system_name: String,
-    pub remote_folder: String,
-    pub file_count: usize,
-    pub total_bytes: u64,
-    pub zero_byte_count: usize,
-    pub part_count: usize,
-}
-
-#[derive(Clone, Debug)]
-pub struct DiagnosticReport {
-    pub disk_space: Option<DiskSpace>,
-    pub systems_usage: Vec<SystemUsage>,
-    pub waste_candidates: Vec<WasteCandidate>,
-    pub total_waste_bytes: u64,
-    pub report_text: String,
-}
+pub use crate::domain::diagnostic::{DiagnosticReport, WasteCandidate, WasteType};
+pub use crate::domain::system::SystemUsage;
 
 /// Valida si una ruta y sus metadatos califican de forma segura para eliminación de residuos.
 /// Rechaza cualquier ruta que:

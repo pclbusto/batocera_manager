@@ -2,6 +2,7 @@ mod app;
 mod chd;
 mod db;
 mod diagnostic;
+mod domain;
 mod hash;
 mod net;
 mod sync;
