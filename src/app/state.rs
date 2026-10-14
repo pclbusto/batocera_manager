@@ -2,7 +2,7 @@ use cosmic::app::Core;
 use cosmic::widget::about::About;
 use cosmic::widget::nav_bar;
 use std::path::PathBuf;
-use crate::{db, diagnostic, systems};
+use crate::{db, diagnostic, services, systems};
 use super::page::Page;
 
 pub struct BatoceraManagerApp {
@@ -74,7 +74,7 @@ impl BatoceraManagerApp {
 
     pub fn rescan_local_systems(&mut self) {
         for sys in &mut self.systems {
-            sys.local_rom_count = systems::count_files_in_dir(&sys.local_folder);
+            sys.local_rom_count = services::library::count_files_in_dir(&sys.local_folder);
         }
     }
 
@@ -96,7 +96,17 @@ impl BatoceraManagerApp {
                     }
                 })
                 .collect();
-            self.games_list = systems::scan_games_for_system(&sys.local_folder, &remote_names);
+            self.games_list = services::library::scan_games_for_system(&sys.local_folder, &remote_names);
+        }
+    }
+
+    pub fn ssh_config(&self) -> crate::net::SshConfig {
+        crate::net::SshConfig {
+            host: self.host_ip.clone(),
+            port: self.ssh_port,
+            user: self.ssh_user.clone(),
+            password: self.ssh_password.clone(),
         }
     }
 }
+

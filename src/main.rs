@@ -5,6 +5,7 @@ mod diagnostic;
 mod domain;
 mod hash;
 mod net;
+mod services;
 mod sync;
 mod systems;
 mod ui;

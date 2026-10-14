@@ -1,3 +1,4 @@
+pub mod handlers;
 pub mod message;
 pub mod page;
 pub mod state;
@@ -15,7 +16,7 @@ use cosmic::widget::about::About;
 use cosmic::widget::{self, nav_bar};
 use std::path::PathBuf;
 
-use crate::{chd, db, sync, systems, ui};
+use crate::{chd, db, services, sync, systems, ui};
 
 pub const APP_ID: &str = "com.github.batocera_manager";
 pub const APP_TITLE: &str = "batocera_manager 0.0.1";
@@ -79,7 +80,7 @@ impl cosmic::Application for BatoceraManagerApp {
 
                 let sys_list = if let Ok(saved) = db::load_system_settings(&conn) {
                     if saved.is_empty() {
-                        let defaults = systems::default_systems_list(&current_roms_root);
+                        let defaults = services::library::default_systems_list(&current_roms_root);
                         for s in &defaults {
                             let _ = db::save_system_setting(&conn, &s.id, &s.name, &s.local_folder_str, s.enabled);
                         }
@@ -89,7 +90,7 @@ impl cosmic::Application for BatoceraManagerApp {
                             .into_iter()
                             .map(|(id, name, folder_str, enabled)| {
                                 let folder = PathBuf::from(&folder_str);
-                                let count = systems::count_files_in_dir(&folder);
+                                let count = services::library::count_files_in_dir(&folder);
                                 systems::SystemConfig {
                                     id: id.clone(),
                                     name,
@@ -105,7 +106,7 @@ impl cosmic::Application for BatoceraManagerApp {
                             .collect()
                     }
                 } else {
-                    systems::default_systems_list(&current_roms_root)
+                    services::library::default_systems_list(&current_roms_root)
                 };
 
                 (sum, recs, sys_list, host, port, user, pass, folder)
@@ -113,7 +114,7 @@ impl cosmic::Application for BatoceraManagerApp {
                 (
                     db::SyncSummary::default(),
                     Vec::new(),
-                    systems::default_systems_list(&roms_root),
+                    services::library::default_systems_list(&roms_root),
                     "batocera.local".to_string(),
                     "22".to_string(),
                     "root".to_string(),
@@ -126,7 +127,7 @@ impl cosmic::Application for BatoceraManagerApp {
 
         let selected_system_index = 0;
         let games_list = if let Some(sys) = systems.first() {
-            systems::scan_games_for_system(&sys.local_folder, &[])
+            services::library::scan_games_for_system(&sys.local_folder, &[])
         } else {
             Vec::new()
         };
