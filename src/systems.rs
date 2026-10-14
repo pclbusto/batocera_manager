@@ -77,7 +77,27 @@ pub fn default_systems_list(base_roms: &Path) -> Vec<SystemConfig> {
     ]
 }
 
-/// Sincroniza únicamente un sistema específico por Wi-Fi
+fn scan_local(root: &Path, cur: &Path, list: &mut Vec<(String, PathBuf, u64)>) {
+    if let Ok(entries) = fs::read_dir(cur) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                scan_local(root, &p, list);
+            } else if p.is_file() {
+                if let Ok(rel) = p.strip_prefix(root) {
+                    let rel_str = rel.to_string_lossy().to_string();
+                    if let Ok(meta) = p.metadata() {
+                        list.push((rel_str, p, meta.len()));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Actualiza y reconcilia el inventario de un sistema con la base de datos local SQLite.
+/// GARANTÍA DE SEGURIDAD: Esta operación es estrictamente de solo lectura hacia la consola.
+/// NUNCA transfiere, modifica, crea ni elimina archivos en el dispositivo remoto.
 pub fn sync_system(
     system: &SystemConfig,
     ssh_config: &SshConfig,
@@ -93,110 +113,88 @@ pub fn sync_system(
         .sftp()
         .map_err(|e| format!("Error abriendo canal SFTP: {e}"))?;
 
-    // 1. Escanear archivos remotos en /userdata/roms/<id>
+    // 1. Escanear inventario remoto en /userdata/roms/<id>
     let remote_roms_dir = format!("/userdata/{}", system.remote_folder);
     let remote_items = net::list_remote_files_recursive(&sftp, &remote_roms_dir, "")
-        .unwrap_or_default();
+        .map_err(|e| format!("Error al consultar inventario remoto de '{}': {e}", system.name))?;
 
     let mut remote_map = std::collections::HashMap::new();
-    for item in remote_items {
+    for item in &remote_items {
         remote_map.insert(item.relative_path.clone(), item.size);
     }
 
-    // 2. Escanear archivos locales
+    // 2. Escanear biblioteca local
     let mut local_files = Vec::new();
-    fn scan_local(root: &Path, cur: &Path, list: &mut Vec<(String, PathBuf, u64)>) {
-        if let Ok(entries) = fs::read_dir(cur) {
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if p.is_dir() {
-                    scan_local(root, &p, list);
-                } else if p.is_file() {
-                    if let Ok(rel) = p.strip_prefix(root) {
-                        let rel_str = rel.to_string_lossy().to_string();
-                        if let Ok(meta) = p.metadata() {
-                            list.push((rel_str, p, meta.len()));
-                        }
-                    }
-                }
-            }
-        }
-    }
     scan_local(&system.local_folder, &system.local_folder, &mut local_files);
 
-    let mut uploaded_count = 0;
-    let mut synced_count = 0;
+    let mut local_map = std::collections::HashMap::new();
+    for (rel_name, local_path, local_size) in &local_files {
+        local_map.insert(rel_name.clone(), (local_path.clone(), *local_size));
+    }
 
-    for (rel_name, local_path, local_size) in local_files {
-        let remote_full_path = format!("{remote_roms_dir}/{rel_name}");
+    // 3. Comparar inventarios y actualizar SQLite sin transferir ningún archivo
+    let mut all_keys = std::collections::BTreeSet::new();
+    for k in local_map.keys() {
+        all_keys.insert(k.clone());
+    }
+    for k in remote_map.keys() {
+        all_keys.insert(k.clone());
+    }
+
+    let mut in_sync_count = 0;
+    let mut only_local_count = 0;
+    let mut only_remote_count = 0;
+    let mut conflict_count = 0;
+
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    for rel_name in all_keys {
         let relative_db_path = format!("{}/{}", system.remote_folder, rel_name);
+        let loc = local_map.get(&rel_name);
+        let rem = remote_map.get(&rel_name);
 
-        let needs_upload = match remote_map.get(&rel_name) {
-            Some(&rem_size) => {
-                if rem_size == local_size {
-                    synced_count += 1;
-                    false
+        let (status, l_size, r_size) = match (loc, rem) {
+            (Some((_, l_s)), Some(r_s)) => {
+                if *l_s == *r_s {
+                    in_sync_count += 1;
+                    (SyncStatus::InSync, Some(*l_s), Some(*r_s))
                 } else {
-                    true
+                    conflict_count += 1;
+                    (SyncStatus::Conflict, Some(*l_s), Some(*r_s))
                 }
             }
-            None => true,
+            (Some((_, l_s)), None) => {
+                only_local_count += 1;
+                (SyncStatus::OnlyLocal, Some(*l_s), None)
+            }
+            (None, Some(r_s)) => {
+                only_remote_count += 1;
+                (SyncStatus::OnlyRemote, None, Some(*r_s))
+            }
+            (None, None) => continue,
         };
 
-        if needs_upload {
-            if let Ok(bytes) = net::upload_file(&sftp, &local_path, &remote_full_path) {
-                uploaded_count += 1;
-
-                let hash_val = hash::compute_file_hash(&local_path).ok();
-                let rec = SyncFileRecord {
-                    relative_path: relative_db_path,
-                    category: "roms".to_string(),
-                    local_size: Some(local_size),
-                    local_mtime: Some(
-                        SystemTime::now()
-                            .duration_since(SystemTime::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs(),
-                    ),
-                    local_hash: hash_val,
-                    remote_size: Some(bytes),
-                    remote_mtime: None,
-                    remote_hash: None,
-                    status: SyncStatus::InSync,
-                    last_sync: Some(
-                        SystemTime::now()
-                            .duration_since(SystemTime::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs(),
-                    ),
-                };
-                let _ = db::upsert_file_record(&conn, &rec);
-            }
-        } else {
-            let rec = SyncFileRecord {
-                relative_path: relative_db_path,
-                category: "roms".to_string(),
-                local_size: Some(local_size),
-                local_mtime: None,
-                local_hash: None,
-                remote_size: Some(local_size),
-                remote_mtime: None,
-                remote_hash: None,
-                status: SyncStatus::InSync,
-                last_sync: Some(
-                    SystemTime::now()
-                        .duration_since(SystemTime::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs(),
-                ),
-            };
-            let _ = db::upsert_file_record(&conn, &rec);
-        }
+        let rec = SyncFileRecord {
+            relative_path: relative_db_path,
+            category: "roms".to_string(),
+            local_size: l_size,
+            local_mtime: None,
+            local_hash: None,
+            remote_size: r_size,
+            remote_mtime: None,
+            remote_hash: None,
+            status,
+            last_sync: Some(now),
+        };
+        let _ = db::upsert_file_record(&conn, &rec);
     }
 
     Ok(format!(
-        "[{}] Sincronización finalizada: {} juegos subidos a Anbernic, {} ya estaban sincronizados.",
-        system.name, uploaded_count, synced_count
+        "[{}] Inventario actualizado: {} juegos en PC, {} en consola ({} sincronizados, {} solo en PC, {} solo en consola, {} con diferencias). 0 archivos transferidos.",
+        system.name, local_files.len(), remote_items.len(), in_sync_count, only_local_count, only_remote_count, conflict_count
     ))
 }
 
@@ -204,7 +202,6 @@ pub fn sync_system(
 pub struct GameItem {
     pub filename: String,
     pub path: PathBuf,
-    #[allow(dead_code)]
     pub size_bytes: u64,
     pub size_formatted: String,
     pub exists_on_console: bool,
@@ -247,7 +244,9 @@ pub fn scan_games_for_system(local_folder: &Path, remote_names: &[String]) -> Ve
                     size_bytes: size,
                     size_formatted: format_size(size),
                     exists_on_console: exists,
-                    selected: !exists, // Pre-seleccionar si aún no está en la consola para facilitar el copiado
+                    // CORRECCIÓN CRÍTICA: La selección inicial siempre debe estar vacía (false).
+                    // Nunca pre-seleccionar automáticamente para evitar transferencias no deseadas.
+                    selected: false,
                 });
             }
         }
@@ -262,16 +261,60 @@ pub fn copy_selected_games_to_console(
     ssh_config: &SshConfig,
     db_path: &Path,
 ) -> Result<String, String> {
+    let selected_games: Vec<&GameItem> = games.iter().filter(|g| g.selected).collect();
+    if selected_games.is_empty() {
+        return Ok("No hay juegos seleccionados para transferir.".to_string());
+    }
+
+    // 1. Validar que ninguna ROM seleccionada tenga 0 bytes
+    for game in &selected_games {
+        if game.size_bytes == 0 {
+            return Err(format!(
+                "El juego '{}' tiene un tamaño de 0 bytes. Transferencia cancelada por seguridad.",
+                game.filename
+            ));
+        }
+    }
+
     let sess = net::create_session(ssh_config)?;
     let sftp = sess.sftp().map_err(|e| format!("Error SFTP: {e}"))?;
     let conn = db::init_db(db_path).ok();
 
+    // 2. Comprobar capacidad remota disponible para el lote completo + margen de seguridad
+    let total_bytes_needed: u64 = selected_games.iter().map(|g| g.size_bytes).sum();
+    let space = net::get_remote_disk_space(&sess, "/userdata")?;
+    let required_with_margin = total_bytes_needed.saturating_add(net::SAFETY_MARGIN_BYTES);
+
+    if space.available_bytes < required_with_margin {
+        return Err(format!(
+            "Espacio insuficiente en la consola: se requieren {} (incluyendo {} de margen de seguridad), pero solo hay {} disponibles en /userdata. Operación cancelada.",
+            format_size(required_with_margin),
+            format_size(net::SAFETY_MARGIN_BYTES),
+            format_size(space.available_bytes)
+        ));
+    }
+
     let mut copied = 0;
     let mut errors = Vec::new();
 
-    for game in games.iter().filter(|g| g.selected) {
+    for game in selected_games {
+        // 3. Re-verificar espacio antes de cada archivo del lote
+        if let Ok(current_space) = net::get_remote_disk_space(&sess, "/userdata") {
+            if current_space.available_bytes < game.size_bytes.saturating_add(net::SAFETY_MARGIN_BYTES) {
+                errors.push(format!(
+                    "Lote detenido por falta de espacio para '{}': disponibles {}, requeridos {}",
+                    game.filename,
+                    format_size(current_space.available_bytes),
+                    format_size(game.size_bytes.saturating_add(net::SAFETY_MARGIN_BYTES))
+                ));
+                break;
+            }
+        }
+
         let remote_dest = format!("/userdata/{}/{}", remote_folder, game.filename);
-        match net::upload_file(&sftp, &game.path, &remote_dest) {
+
+        // 4. Transferencia atómica transaccional (.part -> verificación -> rename)
+        match net::upload_file_atomic(&sftp, Some(&sess), &game.path, &remote_dest, net::SAFETY_MARGIN_BYTES, true) {
             Ok(bytes) => {
                 copied += 1;
                 if let Some(ref c) = conn {
@@ -301,13 +344,20 @@ pub fn copy_selected_games_to_console(
                     let _ = db::upsert_file_record(c, &rec);
                 }
             }
-            Err(e) => errors.push(format!("{}: {e}", game.filename)),
+            Err(e) => {
+                let is_space = e.contains("Espacio insuficiente") || e.contains("No space left");
+                errors.push(format!("{}: {e}", game.filename));
+                if is_space {
+                    errors.push("Lote detenido inmediatamente para proteger la tarjeta SD contra llenado.".to_string());
+                    break;
+                }
+            }
         }
     }
 
     if !errors.is_empty() {
-        Err(format!("Copiados {copied} juegos. Errores: {}", errors.join("; ")))
+        Err(format!("Copiados {copied} juego(s). Errores / alertas: {}", errors.join("; ")))
     } else {
-        Ok(format!("Se copiaron exitosamente {copied} juego(s) a la consola."))
+        Ok(format!("Se copiaron exitosamente {copied} juego(s) a la consola de forma verificada."))
     }
 }

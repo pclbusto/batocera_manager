@@ -1,5 +1,6 @@
 mod chd;
 mod db;
+mod diagnostic;
 mod hash;
 mod net;
 mod sync;
@@ -84,7 +85,7 @@ pub enum Message {
     PickLocalFolder,
     LocalFolderSelected(Option<PathBuf>),
 
-    // Sincronización por Sistemas
+    // Sincronización e Inventario por Sistemas
     ToggleSystem(usize, bool),
     SystemFolderInputChanged(usize, String),
     PickSystemFolder(usize),
@@ -101,8 +102,16 @@ pub enum Message {
     SelectAllMissingGames,
     DeselectAllGames,
     CopySelectedGamesToConsole,
+    ConfirmCopySelectedGames,
+    CancelCopyConfirmation,
     CopySelectedGamesFinished(Result<String, String>),
     RefreshGamesList,
+
+    // Diagnóstico y Limpieza Segura de Residuos
+    RunDiagnostic,
+    DiagnosticFinished(Result<diagnostic::DiagnosticReport, String>),
+    CleanWasteFiles(Vec<String>),
+    CleanWasteFinished(Result<usize, String>),
 
     // Conversor CHD
     PickSingleCueFile,
@@ -156,7 +165,12 @@ pub struct BatoceraManagerApp {
     selected_system_index: usize,
     games_list: Vec<systems::GameItem>,
     is_copying_games: bool,
+    show_copy_confirmation: bool,
     rom_search_query: String,
+
+    // Diagnóstico
+    is_diagnosing: bool,
+    latest_diagnostic: Option<diagnostic::DiagnosticReport>,
 
     // Conversor CHD
     chdman_version: Option<String>,
@@ -276,7 +290,7 @@ impl cosmic::Application for BatoceraManagerApp {
             .unwrap_or(local_base_dir);
 
         let selected_system_index = 0;
-        let games_list = if let Some(sys) = systems.get(0) {
+        let games_list = if let Some(sys) = systems.first() {
             systems::scan_games_for_system(&sys.local_folder, &[])
         } else {
             Vec::new()
@@ -337,8 +351,12 @@ impl cosmic::Application for BatoceraManagerApp {
             selected_system_index,
             games_list,
             is_copying_games: false,
+            show_copy_confirmation: false,
 
             rom_search_query: String::new(),
+
+            is_diagnosing: false,
+            latest_diagnostic: None,
 
             chdman_version: chdman_ver,
             single_cue_path: String::new(),
@@ -655,6 +673,16 @@ impl cosmic::Application for BatoceraManagerApp {
                 self.reload_games_for_selected_system();
             }
             Message::CopySelectedGamesToConsole => {
+                let selected_count = self.games_list.iter().filter(|g| g.selected).count();
+                if selected_count > 0 {
+                    self.show_copy_confirmation = true;
+                }
+            }
+            Message::CancelCopyConfirmation => {
+                self.show_copy_confirmation = false;
+            }
+            Message::ConfirmCopySelectedGames => {
+                self.show_copy_confirmation = false;
                 if self.is_copying_games || self.selected_system_index >= self.systems.len() {
                     return Task::none();
                 }
@@ -679,9 +707,10 @@ impl cosmic::Application for BatoceraManagerApp {
                     password: self.ssh_password.clone(),
                 };
 
+                let total_size: u64 = selected_games.iter().map(|g| g.size_bytes).sum();
                 self.log_output.push_str(&format!(
-                    "\n🚀 Copiando {} juego(s) de '{}' hacia la Anbernic (/userdata/{}/)...\n",
-                    selected_games.len(), sys.name, sys.remote_folder
+                    "\n🚀 Iniciando transferencia verificada de {} juego(s) ({}) de '{}' hacia la Anbernic (/userdata/{}/)...\n",
+                    selected_games.len(), systems::format_size(total_size), sys.name, sys.remote_folder
                 ));
 
                 return Task::perform(
@@ -705,6 +734,84 @@ impl cosmic::Application for BatoceraManagerApp {
                     }
                     Err(err) => {
                         self.log_output.push_str(&format!("❌ {err}\n"));
+                    }
+                }
+            }
+
+            // Diagnóstico de Almacenamiento y Limpieza Segura
+            Message::RunDiagnostic => {
+                if self.is_diagnosing {
+                    return Task::none();
+                }
+                self.is_diagnosing = true;
+                let config = net::SshConfig {
+                    host: self.host_ip.clone(),
+                    port: self.ssh_port,
+                    user: self.ssh_user.clone(),
+                    password: self.ssh_password.clone(),
+                };
+                let sys_list = self.systems.clone();
+                self.log_output.push_str("\n🔍 Iniciando diagnóstico no destructivo de almacenamiento en la consola...\n");
+
+                return Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            let sess = net::create_session(&config)?;
+                            let sftp = sess.sftp().map_err(|e| format!("Error abriendo SFTP: {e}"))?;
+                            diagnostic::run_storage_diagnostic(&sess, &sftp, &sys_list)
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(format!("Fallo en tarea: {e}")))
+                    },
+                    |res| cosmic::Action::App(Message::DiagnosticFinished(res)),
+                );
+            }
+            Message::DiagnosticFinished(res) => {
+                self.is_diagnosing = false;
+                match res {
+                    Ok(report) => {
+                        self.log_output.push_str(&report.report_text);
+                        self.latest_diagnostic = Some(report);
+                    }
+                    Err(e) => {
+                        self.log_output.push_str(&format!("❌ Error durante el diagnóstico: {e}\n"));
+                    }
+                }
+            }
+            Message::CleanWasteFiles(paths) => {
+                let config = net::SshConfig {
+                    host: self.host_ip.clone(),
+                    port: self.ssh_port,
+                    user: self.ssh_user.clone(),
+                    password: self.ssh_password.clone(),
+                };
+                self.log_output.push_str(&format!(
+                    "\n🧹 Iniciando eliminación segura de {} residuo(s) confirmado(s)...\n",
+                    paths.len()
+                ));
+
+                return Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            let sess = net::create_session(&config)?;
+                            let sftp = sess.sftp().map_err(|e| format!("Error abriendo SFTP: {e}"))?;
+                            diagnostic::clean_confirmed_waste(&sftp, &paths)
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(format!("Fallo en tarea: {e}")))
+                    },
+                    |res| cosmic::Action::App(Message::CleanWasteFinished(res)),
+                );
+            }
+            Message::CleanWasteFinished(res) => {
+                match res {
+                    Ok(count) => {
+                        self.log_output.push_str(&format!("✅ Se eliminaron de forma segura {count} residuo(s).\n"));
+                        self.latest_diagnostic = None;
+                        self.reload_games_for_selected_system();
+                    }
+                    Err(e) => {
+                        self.log_output.push_str(&format!("⚠️ Resultado de limpieza: {e}\n"));
                     }
                 }
             }
@@ -1203,11 +1310,20 @@ impl BatoceraManagerApp {
             );
 
         // Acciones rápidas
-        let quick_actions = widget::row::with_capacity(4)
+        let diag_btn_label = if self.is_diagnosing {
+            "🔍 Analizando SD..."
+        } else {
+            "🔍 Diagnóstico Tarjeta SD"
+        };
+        let diag_btn = widget::button::standard(diag_btn_label)
+            .on_press(Message::RunDiagnostic);
+
+        let quick_actions = widget::row::with_capacity(5)
             .push(
-                widget::button::suggested("⚡ Sincronizar Sistemas Activos")
+                widget::button::suggested("🔄 Reconciliar Inventarios")
                     .on_press(Message::SyncAllEnabledSystems),
             )
+            .push(diag_btn)
             .push(
                 widget::button::standard("💾 Sincronizar Partidas")
                     .on_press(Message::StartSyncSaves),
@@ -1235,11 +1351,11 @@ impl BatoceraManagerApp {
     }
 
     fn view_sync(&self) -> Element<'_, Message> {
-        let title = widget::text::title2("Sincronización por Sistemas (Anbernic ⇄ PC)");
+        let title = widget::text::title2("Gestión e Inventario por Sistemas (Anbernic ⇄ PC)");
         let desc = widget::text::body(
-            "Configura la carpeta local en tu PC para cada consola y elige cuáles deseas mantener sincronizadas por Wi-Fi.\n\
-            ¿Qué hace sincronizar? Compara la consola contra tu PC y sube automáticamente los juegos que falten o actualiza las partidas \
-            guardadas más recientes sin borrar nada.",
+            "Configura la carpeta local en tu PC para cada consola y mantén actualizado el inventario por Wi-Fi.\n\
+            ¿Qué hace 'Actualizar Inventario'? Compara la consola contra tu PC y registra el estado en la base de datos local sin transferir ni borrar ningún archivo.\n\
+            Para copiar juegos específicos a la consola, ve a la pestaña 'Explorador y Copiado de Juegos'.",
         );
 
         // 1. Barra de estado y acciones globales
@@ -1247,10 +1363,18 @@ impl BatoceraManagerApp {
         let total_local_roms: usize = self.systems.iter().map(|s| s.local_rom_count).sum();
 
         let sync_all_btn = if self.is_syncing {
-            widget::button::suggested("Sincronizando sistemas...").width(Length::Shrink)
+            widget::button::suggested("Reconciliando inventarios...").width(Length::Shrink)
         } else {
-            widget::button::suggested(format!("⚡ Sincronizar {enabled_count} Sistemas Activos"))
+            widget::button::suggested(format!("🔄 Actualizar Inventario ({enabled_count} Sistemas)"))
                 .on_press(Message::SyncAllEnabledSystems)
+                .width(Length::Shrink)
+        };
+
+        let diag_btn = if self.is_diagnosing {
+            widget::button::standard("Ejecutando diagnóstico...").width(Length::Shrink)
+        } else {
+            widget::button::standard("🔍 Diagnóstico de Residuos SD")
+                .on_press(Message::RunDiagnostic)
                 .width(Length::Shrink)
         };
 
@@ -1271,7 +1395,10 @@ impl BatoceraManagerApp {
                 ),
             )
             .add(
-                settings::item("Acción masiva por Wi-Fi", sync_all_btn),
+                settings::item("Inventario por Wi-Fi (solo lectura)", sync_all_btn),
+            )
+            .add(
+                settings::item("Inspección de residuos (0 bytes / .part)", diag_btn),
             )
             .add(
                 settings::item("Comprobar cambios locales", rescan_btn),
@@ -1279,6 +1406,36 @@ impl BatoceraManagerApp {
             .add(
                 settings::item("Partidas guardadas (/userdata/saves)", sync_saves_btn),
             );
+
+        // Sección de residuos si se detectaron
+        let waste_section: Option<Element<'_, Message>> = if let Some(ref diag) = self.latest_diagnostic {
+            if !diag.waste_candidates.is_empty() {
+                let paths: Vec<String> = diag.waste_candidates.iter().map(|w| w.full_remote_path.clone()).collect();
+                let clean_btn = widget::button::destructive(format!(
+                    "Limpiar {} residuos detectados ({})",
+                    diag.waste_candidates.len(),
+                    systems::format_size(diag.total_waste_bytes)
+                ))
+                .on_press(Message::CleanWasteFiles(paths));
+
+                Some(
+                    settings::section()
+                        .title("⚠️ Residuos Detectados en Tarjeta SD (Archivos 0B / .part)")
+                        .add(settings::item(
+                            format!(
+                                "Se detectaron {} archivos de 0 bytes o temporales .part huérfanos. Ninguno ha sido borrado.",
+                                diag.waste_candidates.len()
+                            ),
+                            clean_btn,
+                        ))
+                        .into()
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         // 2. Tarjetas de cada sistema / consola
         let mut systems_column = widget::column::with_capacity(self.systems.len() + 1)
@@ -1305,7 +1462,7 @@ impl BatoceraManagerApp {
             let sync_btn = if self.is_syncing {
                 widget::button::standard("Ocupado...").width(Length::Shrink)
             } else {
-                widget::button::standard(format!("Sincronizar {}", sys.id))
+                widget::button::standard(format!("Actualizar {}", sys.id))
                     .on_press(Message::SyncSingleSystem(idx))
                     .width(Length::Shrink)
             };
@@ -1318,7 +1475,7 @@ impl BatoceraManagerApp {
             let sys_section = settings::section()
                 .title(format!("🎮 {} ({})", sys.name, sys.id))
                 .add(
-                    settings::item("Habilitar sincronización para esta consola", toggle),
+                    settings::item("Habilitar para esta consola", toggle),
                 )
                 .add(
                     settings::item("Carpeta local en el PC", folder_row),
@@ -1351,10 +1508,16 @@ impl BatoceraManagerApp {
         .padding(12)
         .width(Length::Fill);
 
-        let content = widget::column::with_capacity(6)
+        let mut content = widget::column::with_capacity(7)
             .push(title)
             .push(desc)
-            .push(overview_section)
+            .push(overview_section);
+
+        if let Some(ws) = waste_section {
+            content = content.push(ws);
+        }
+
+        content = content
             .push(systems_column)
             .push(log_header)
             .push(log_display)
@@ -1406,6 +1569,7 @@ impl BatoceraManagerApp {
 
         // 3. Barra de herramientas para selección y copiado
         let selected_count = self.games_list.iter().filter(|g| g.selected).count();
+        let total_selected_bytes: u64 = self.games_list.iter().filter(|g| g.selected).map(|g| g.size_bytes).sum();
 
         let copy_btn = if self.is_copying_games {
             widget::button::suggested("Copiando juegos por Wi-Fi...").width(Length::Shrink)
@@ -1432,6 +1596,32 @@ impl BatoceraManagerApp {
             .push(deselect_btn)
             .push(refresh_btn)
             .spacing(10);
+
+        // Sección de confirmación previa a la transferencia
+        let confirmation_section: Option<Element<'_, Message>> = if self.show_copy_confirmation {
+            let confirm_btn = widget::button::suggested("✓ Confirmar e Iniciar Copiado")
+                .on_press(Message::ConfirmCopySelectedGames);
+            let cancel_btn = widget::button::standard("✕ Cancelar")
+                .on_press(Message::CancelCopyConfirmation);
+            let btn_row = widget::row::with_capacity(2).push(confirm_btn).push(cancel_btn).spacing(8);
+
+            Some(
+                settings::section()
+                    .title("⚠️ Confirmar Transferencia hacia la Consola")
+                    .add(settings::item(
+                        format!(
+                            "Se transferirán {} juego(s) ({} total) hacia /userdata/{}. ¿Proceder?",
+                            selected_count,
+                            systems::format_size(total_selected_bytes),
+                            current_sys.remote_folder
+                        ),
+                        btn_row,
+                    ))
+                    .into()
+            )
+        } else {
+            None
+        };
 
         let search_bar = widget::text_input::search_input("Buscar por título de juego...", &self.rom_search_query)
             .on_input(Message::SearchRoms);
@@ -1479,11 +1669,17 @@ impl BatoceraManagerApp {
             }
         }
 
-        let content = widget::column::with_capacity(8)
+        let mut content = widget::column::with_capacity(9)
             .push(title)
             .push(desc)
             .push(system_scroll)
-            .push(sys_header_section)
+            .push(sys_header_section);
+
+        if let Some(conf) = confirmation_section {
+            content = content.push(conf);
+        }
+
+        content = content
             .push(toolbar)
             .push(search_bar)
             .push(games_section)

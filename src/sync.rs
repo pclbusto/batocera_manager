@@ -82,11 +82,11 @@ pub fn scan_and_reconcile(
     let mut remote_map = HashMap::new();
     let categories = ["saves", "roms", "bios"];
     for cat in &categories {
-        if let Ok(remote_items) = net::list_remote_files_recursive(&sftp, "/userdata", cat) {
-            for item in remote_items {
-                let full_rel = format!("{}/{}", cat, item.relative_path);
-                remote_map.insert(full_rel, (item.size, item.mtime));
-            }
+        let remote_items = net::list_remote_files_recursive(&sftp, "/userdata", cat)
+            .map_err(|e| format!("Error escaneando '{cat}' en la consola: {e}"))?;
+        for item in remote_items {
+            let full_rel = format!("{}/{}", cat, item.relative_path);
+            remote_map.insert(full_rel, (item.size, item.mtime));
         }
     }
 
@@ -218,8 +218,8 @@ pub fn sync_saves_bidirectional(
                 }
             }
             SyncStatus::LocalNewer | SyncStatus::OnlyLocal => {
-                // Subir desde el PC a la Anbernic
-                if let Ok(bytes) = net::upload_file(&sftp, &local_file, &remote_file) {
+                // Subir desde el PC a la Anbernic de forma atómica y protegida
+                if let Ok(bytes) = net::upload_file_atomic(&sftp, Some(&sess), &local_file, &remote_file, net::SAFETY_MARGIN_BYTES, true) {
                     uploaded += 1;
                     rec.status = SyncStatus::InSync;
                     rec.remote_size = Some(bytes);
@@ -236,7 +236,7 @@ pub fn sync_saves_bidirectional(
     ))
 }
 
-/// Sincroniza ROMs desde el PC hacia la Anbernic
+/// Sincroniza ROMs desde el PC hacia la Anbernic con control estricto de capacidad y atomicidad
 pub fn sync_roms_to_anbernic(
     db_path: &Path,
     local_base: &Path,
@@ -252,23 +252,38 @@ pub fn sync_roms_to_anbernic(
         .map_err(|e| format!("Error abriendo canal SFTP: {e}"))?;
 
     let mut transferred = 0;
+    let mut errors = Vec::new();
 
     for mut rec in records {
         if rec.status == SyncStatus::OnlyLocal || rec.status == SyncStatus::LocalNewer {
             let local_file = local_base.join(&rec.relative_path);
             let remote_file = format!("/userdata/{}", rec.relative_path);
 
-            if let Ok(bytes) = net::upload_file(&sftp, &local_file, &remote_file) {
-                transferred += 1;
-                rec.status = SyncStatus::InSync;
-                rec.remote_size = Some(bytes);
-                let _ = db::upsert_file_record(&conn, &rec);
+            match net::upload_file_atomic(&sftp, Some(&sess), &local_file, &remote_file, net::SAFETY_MARGIN_BYTES, true) {
+                Ok(bytes) => {
+                    transferred += 1;
+                    rec.status = SyncStatus::InSync;
+                    rec.remote_size = Some(bytes);
+                    let _ = db::upsert_file_record(&conn, &rec);
+                }
+                Err(e) => {
+                    let is_space = e.contains("Espacio insuficiente") || e.contains("No space left");
+                    errors.push(format!("{}: {e}", rec.relative_path));
+                    if is_space {
+                        errors.push("Lote de sincronización detenido por falta de espacio en la consola.".to_string());
+                        break;
+                    }
+                }
             }
         }
     }
 
-    Ok(format!(
-        "Sincronización de ROMs completada: {} juegos transferidos a la Anbernic.",
-        transferred
-    ))
+    if !errors.is_empty() {
+        Err(format!("Transferidos {transferred} juegos. Errores: {}", errors.join("; ")))
+    } else {
+        Ok(format!(
+            "Sincronización de ROMs completada: {} juegos transferidos a la Anbernic.",
+            transferred
+        ))
+    }
 }
