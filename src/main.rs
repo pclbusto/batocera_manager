@@ -5,14 +5,14 @@ mod hash;
 mod net;
 mod sync;
 mod systems;
+mod ui;
 
 use cosmic::app::context_drawer::{self, ContextDrawer};
 use cosmic::app::{Core, Settings, Task};
-use cosmic::iced::alignment::Horizontal;
 use cosmic::iced::{Length, Size};
 use cosmic::prelude::*;
 use cosmic::widget::about::About;
-use cosmic::widget::{self, nav_bar, settings};
+use cosmic::widget::{self, nav_bar};
 use std::path::PathBuf;
 
 const APP_ID: &str = "com.github.batocera_manager";
@@ -135,56 +135,56 @@ pub enum Message {
 
 pub struct BatoceraManagerApp {
     core: Core,
-    nav_model: nav_bar::Model,
-    active_page: Page,
-    about: About,
-    show_about: bool,
+    pub nav_model: nav_bar::Model,
+    pub active_page: Page,
+    pub about: About,
+    pub show_about: bool,
 
     // Parámetros de red Wi-Fi y Batocera
-    is_connected: bool,
-    host_ip: String,
-    ssh_port: u16,
-    ssh_port_str: String,
-    ssh_user: String,
-    ssh_password: String,
-    local_base_dir: PathBuf,
-    local_base_dir_str: String,
-    auto_sync: bool,
-    wifi_test_result: Option<Result<String, String>>,
+    pub is_connected: bool,
+    pub host_ip: String,
+    pub ssh_port: u16,
+    pub ssh_port_str: String,
+    pub ssh_user: String,
+    pub ssh_password: String,
+    pub local_base_dir: PathBuf,
+    pub local_base_dir_str: String,
+    pub auto_sync: bool,
+    pub wifi_test_result: Option<Result<String, String>>,
 
     // Base de datos y Sincronización
-    db_path: PathBuf,
-    db_path_str: String,
-    sync_summary: db::SyncSummary,
-    sync_records: Vec<db::SyncFileRecord>,
-    selected_category: String,
-    is_syncing: bool,
+    pub db_path: PathBuf,
+    pub db_path_str: String,
+    pub sync_summary: db::SyncSummary,
+    pub sync_records: Vec<db::SyncFileRecord>,
+    pub selected_category: String,
+    pub is_syncing: bool,
 
     // Sistemas / Consolas
-    systems: Vec<systems::SystemConfig>,
+    pub systems: Vec<systems::SystemConfig>,
 
     // Explorador de Juegos
-    selected_system_index: usize,
-    games_list: Vec<systems::GameItem>,
-    is_copying_games: bool,
-    show_copy_confirmation: bool,
-    rom_search_query: String,
+    pub selected_system_index: usize,
+    pub games_list: Vec<systems::GameItem>,
+    pub is_copying_games: bool,
+    pub show_copy_confirmation: bool,
+    pub rom_search_query: String,
 
     // Diagnóstico
-    is_diagnosing: bool,
-    latest_diagnostic: Option<diagnostic::DiagnosticReport>,
-    show_waste_confirmation: bool,
+    pub is_diagnosing: bool,
+    pub latest_diagnostic: Option<diagnostic::DiagnosticReport>,
+    pub show_waste_confirmation: bool,
 
     // Conversor CHD
-    chdman_version: Option<String>,
-    single_cue_path: String,
-    single_output_path: String,
-    batch_folder_path: String,
-    found_cues: Vec<PathBuf>,
-    force_overwrite: bool,
-    delete_source_after: bool,
-    is_converting: bool,
-    log_output: String,
+    pub chdman_version: Option<String>,
+    pub single_cue_path: String,
+    pub single_output_path: String,
+    pub batch_folder_path: String,
+    pub found_cues: Vec<PathBuf>,
+    pub force_overwrite: bool,
+    pub delete_source_after: bool,
+    pub is_converting: bool,
+    pub log_output: String,
 }
 
 impl cosmic::Application for BatoceraManagerApp {
@@ -1208,11 +1208,11 @@ impl cosmic::Application for BatoceraManagerApp {
 
     fn view(&self) -> Element<'_, Self::Message> {
         let page_element = match self.active_page {
-            Page::Dashboard => self.view_dashboard(),
-            Page::Sync => self.view_sync(),
-            Page::Roms => self.view_roms(),
-            Page::ChdConverter => self.view_chd_converter(),
-            Page::Settings => self.view_settings(),
+            Page::Dashboard => ui::dashboard::view(self),
+            Page::Sync => ui::sync::view(self),
+            Page::Roms => ui::roms::view(self),
+            Page::ChdConverter => ui::chd::view(self),
+            Page::Settings => ui::settings::view(self),
         };
 
         let scroll = widget::scrollable(page_element)
@@ -1260,758 +1260,11 @@ impl BatoceraManagerApp {
         }
     }
 
-    fn view_dashboard(&self) -> Element<'_, Message> {
-        let app_badge = widget::text::title2(APP_TITLE);
-        let app_subtitle = widget::text::body(
-            "Administrador de sistemas por consola, copiado selectivo de juegos, sincronizador Wi-Fi y conversor CHD.",
-        );
 
-        let header_box = widget::column::with_capacity(2)
-            .push(app_badge)
-            .push(app_subtitle)
-            .spacing(4);
 
-        // Tarjeta de estado de conexión Wi-Fi
-        let status_text = if self.is_connected {
-            format!("🟢 Conectado por Wi-Fi a Batocera en {}:{}", self.host_ip, self.ssh_port)
-        } else {
-            format!("⚪ Sin comprobar / Desconectado ({}:{})", self.host_ip, self.ssh_port)
-        };
 
-        let connect_btn = widget::button::suggested("Probar enlace Wi-Fi")
-            .on_press(Message::TestWifiConnection);
 
-        let connection_card = settings::section()
-            .title("Conexión con Anbernic")
-            .add(
-                settings::item("Estado Wi-Fi / SSH", widget::text::body(status_text)),
-            )
-            .add(
-                settings::item("Diagnóstico de red", connect_btn),
-            );
 
-        // Tarjeta resumen de sistemas
-        let enabled_count = self.systems.iter().filter(|s| s.enabled).count();
-        let total_local_roms: usize = self.systems.iter().map(|s| s.local_rom_count).sum();
 
-        let systems_overview_card = settings::section()
-            .title("Resumen de Consolas y Sistemas")
-            .add(
-                settings::item(
-                    "Sistemas activos para sincronizar",
-                    widget::text::body(format!("{enabled_count} de {} sistemas habilitados", self.systems.len())),
-                ),
-            )
-            .add(
-                settings::item(
-                    "Juegos locales detectados en PC",
-                    widget::text::body(format!("{total_local_roms} juegos distribuidos por carpetas")),
-                ),
-            );
 
-        // Tarjeta chdman
-        let chdman_label = if let Some(ref ver) = self.chdman_version {
-            format!("🟢 {ver} instalado")
-        } else {
-            "🔴 No detectado (requiere paquete mame-tools)".to_string()
-        };
-
-        let tools_card = settings::section()
-            .title("Herramientas del Sistema")
-            .add(
-                settings::item(
-                    "Utilidad chdman",
-                    widget::text::body(chdman_label),
-                ),
-            );
-
-        // Acciones rápidas
-        let diag_btn_label = if self.is_diagnosing {
-            "🔍 Analizando SD..."
-        } else {
-            "🔍 Diagnóstico Tarjeta SD"
-        };
-        let diag_btn = widget::button::standard(diag_btn_label)
-            .on_press(Message::RunDiagnostic);
-
-        let quick_actions = widget::row::with_capacity(5)
-            .push(
-                widget::button::suggested("🔄 Reconciliar Inventarios")
-                    .on_press(Message::SyncAllEnabledSystems),
-            )
-            .push(diag_btn)
-            .push(
-                widget::button::standard("💾 Sincronizar Partidas")
-                    .on_press(Message::StartSyncSaves),
-            )
-            .push(
-                widget::button::standard("ℹ️ Acerca de")
-                    .on_press(Message::ToggleAbout),
-            )
-            .spacing(12);
-
-        let content = widget::column::with_capacity(6)
-            .push(header_box)
-            .push(connection_card)
-            .push(systems_overview_card)
-            .push(tools_card)
-            .push(quick_actions)
-            .spacing(24)
-            .padding(24)
-            .max_width(940);
-
-        widget::container(content)
-            .width(Length::Fill)
-            .align_x(Horizontal::Center)
-            .into()
-    }
-
-    fn view_sync(&self) -> Element<'_, Message> {
-        let title = widget::text::title2("Gestión e Inventario por Sistemas (Anbernic ⇄ PC)");
-        let desc = widget::text::body(
-            "Configura la carpeta local en tu PC para cada consola y mantén actualizado el inventario por Wi-Fi.\n\
-            ¿Qué hace 'Actualizar Inventario'? Compara la consola contra tu PC y registra el estado en la base de datos local sin transferir ni borrar ningún archivo.\n\
-            Para copiar juegos específicos a la consola, ve a la pestaña 'Explorador y Copiado de Juegos'.",
-        );
-
-        // 1. Barra de estado y acciones globales
-        let enabled_count = self.systems.iter().filter(|s| s.enabled).count();
-        let total_local_roms: usize = self.systems.iter().map(|s| s.local_rom_count).sum();
-
-        let sync_all_btn = if self.is_syncing {
-            widget::button::suggested("Reconciliando inventarios...").width(Length::Shrink)
-        } else {
-            widget::button::suggested(format!("🔄 Actualizar Inventario ({enabled_count} Sistemas)"))
-                .on_press(Message::SyncAllEnabledSystems)
-                .width(Length::Shrink)
-        };
-
-        let diag_btn = if self.is_diagnosing {
-            widget::button::standard("Ejecutando diagnóstico...").width(Length::Shrink)
-        } else {
-            widget::button::standard("🔍 Diagnóstico de Residuos SD")
-                .on_press(Message::RunDiagnostic)
-                .width(Length::Shrink)
-        };
-
-        let rescan_btn = widget::button::standard("🔄 Re-escanear Carpetas")
-            .on_press(Message::RescanSystems)
-            .width(Length::Shrink);
-
-        let sync_saves_btn = widget::button::standard("💾 Sincronizar Partidas")
-            .on_press(Message::StartSyncSaves)
-            .width(Length::Shrink);
-
-        let overview_section = settings::section()
-            .title("Control Global de Sincronización")
-            .add(
-                settings::item(
-                    "Estado de Sistemas",
-                    widget::text::body(format!("{enabled_count} activados de {} totales  |  {total_local_roms} juegos en PC", self.systems.len())),
-                ),
-            )
-            .add(
-                settings::item("Inventario por Wi-Fi (solo lectura)", sync_all_btn),
-            )
-            .add(
-                settings::item("Inspección de residuos (0 bytes / .part)", diag_btn),
-            )
-            .add(
-                settings::item("Comprobar cambios locales", rescan_btn),
-            )
-            .add(
-                settings::item("Partidas guardadas (/userdata/saves)", sync_saves_btn),
-            );
-
-        // Sección de residuos si se detectaron
-        let waste_section: Option<Element<'_, Message>> = if let Some(ref diag) = self.latest_diagnostic {
-            if !diag.waste_candidates.is_empty() {
-                let selected_count = diag.waste_candidates.iter().filter(|w| w.selected).count();
-                let selected_bytes: u64 = diag
-                    .waste_candidates
-                    .iter()
-                    .filter(|w| w.selected)
-                    .map(|w| w.size_bytes)
-                    .sum();
-
-                let mut section = settings::section()
-                    .title("⚠️ Residuos Detectados en Tarjeta SD (Archivos 0B / .part)");
-
-                // Diálogo de confirmación explícita previa a la eliminación
-                if self.show_waste_confirmation {
-                    let confirm_btn = widget::button::destructive("✓ Confirmar Eliminación")
-                        .on_press(Message::ConfirmCleanWaste);
-                    let cancel_btn = widget::button::standard("✕ Cancelar")
-                        .on_press(Message::CancelCleanWaste);
-                    let btn_row = widget::row::with_capacity(2)
-                        .push(confirm_btn)
-                        .push(cancel_btn)
-                        .spacing(8);
-
-                    section = section.add(settings::item(
-                        format!(
-                            "¿Confirmas eliminar permanentemente {} archivo(s) seleccionado(s) ({}) de la consola? Esta acción no se puede deshacer.",
-                            selected_count,
-                            systems::format_size(selected_bytes)
-                        ),
-                        btn_row,
-                    ));
-                }
-
-                // Barra de herramientas: seleccionar / deseleccionar y botón de limpieza
-                let select_all_btn = widget::button::standard("Seleccionar todos")
-                    .on_press(Message::SelectAllWaste(true));
-                let deselect_all_btn = widget::button::standard("Deseleccionar todos")
-                    .on_press(Message::SelectAllWaste(false));
-
-                let clean_btn = if selected_count > 0 {
-                    widget::button::destructive(format!(
-                        "Limpiar {} seleccionados ({})",
-                        selected_count,
-                        systems::format_size(selected_bytes)
-                    ))
-                    .on_press(Message::RequestCleanWaste)
-                } else {
-                    widget::button::destructive("Limpiar seleccionados (0)")
-                };
-
-                let toolbar = widget::row::with_capacity(3)
-                    .push(clean_btn)
-                    .push(select_all_btn)
-                    .push(deselect_all_btn)
-                    .spacing(8);
-
-                section = section.add(settings::item(
-                    format!(
-                        "Selecciona individualmente los archivos a eliminar ({} detectados, {} seleccionados):",
-                        diag.waste_candidates.len(),
-                        selected_count
-                    ),
-                    toolbar,
-                ));
-
-                // Lista de candidatos individuales con checkboxes
-                for (idx, w) in diag.waste_candidates.iter().enumerate() {
-                    let desc = format!(
-                        "Consola: {}  |  {}  |  {}",
-                        w.system_id,
-                        w.waste_type.description(),
-                        systems::format_size(w.size_bytes)
-                    );
-                    let item = settings::item::builder(w.relative_path.as_str())
-                        .description(desc)
-                        .checkbox(w.selected, move |val| Message::ToggleWasteCandidate(idx, val));
-                    section = section.add(item);
-                }
-
-                Some(section.into())
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        // 2. Tarjetas de cada sistema / consola
-        let mut systems_column = widget::column::with_capacity(self.systems.len() + 1)
-            .spacing(16);
-
-        systems_column = systems_column.push(widget::text::title3("Consolas y Sistemas Configurados"));
-
-        for (idx, sys) in self.systems.iter().enumerate() {
-            let toggle = widget::toggler(sys.enabled)
-                .on_toggle(move |val| Message::ToggleSystem(idx, val));
-
-            let folder_input = widget::text_input::text_input("Ruta local en PC...", &sys.local_folder_str)
-                .on_input(move |val| Message::SystemFolderInputChanged(idx, val));
-
-            let browse_btn = widget::button::standard("Examinar...")
-                .on_press(Message::PickSystemFolder(idx));
-
-            let folder_row = widget::row::with_capacity(2)
-                .push(folder_input)
-                .push(browse_btn)
-                .spacing(8)
-                .width(Length::Fill);
-
-            let sync_btn = if self.is_syncing {
-                widget::button::standard("Ocupado...").width(Length::Shrink)
-            } else {
-                widget::button::standard(format!("Actualizar {}", sys.id))
-                    .on_press(Message::SyncSingleSystem(idx))
-                    .width(Length::Shrink)
-            };
-
-            let rom_status_label = format!(
-                "📁 {} juegos locales  |  Destino Anbernic: /userdata/{}  |  Estado: {}",
-                sys.local_rom_count, sys.remote_folder, sys.status_msg
-            );
-
-            let sys_section = settings::section()
-                .title(format!("🎮 {} ({})", sys.name, sys.id))
-                .add(
-                    settings::item("Habilitar para esta consola", toggle),
-                )
-                .add(
-                    settings::item("Carpeta local en el PC", folder_row),
-                )
-                .add(
-                    settings::item(rom_status_label, sync_btn),
-                );
-
-            systems_column = systems_column.push(sys_section);
-        }
-
-        // 3. Consola de registros
-        let clear_log_btn = widget::button::standard("Limpiar registro")
-            .on_press(Message::ClearLogs);
-
-        let log_header = widget::row::with_capacity(3)
-            .push(widget::text::title3("Registro de Sincronización"))
-            .push(cosmic::iced::widget::space::horizontal().width(Length::Fill))
-            .push(clear_log_btn)
-            .align_y(cosmic::iced::alignment::Vertical::Center);
-
-        let log_display = widget::container(
-            widget::scrollable(
-                widget::text(&self.log_output)
-                    .size(13)
-                    .width(Length::Fill),
-            )
-            .height(Length::Fixed(180.0)),
-        )
-        .padding(12)
-        .width(Length::Fill);
-
-        let mut content = widget::column::with_capacity(7)
-            .push(title)
-            .push(desc)
-            .push(overview_section);
-
-        if let Some(ws) = waste_section {
-            content = content.push(ws);
-        }
-
-        content = content
-            .push(systems_column)
-            .push(log_header)
-            .push(log_display)
-            .spacing(20)
-            .padding(24)
-            .max_width(940);
-
-        widget::container(content)
-            .width(Length::Fill)
-            .align_x(Horizontal::Center)
-            .into()
-    }
-
-    fn view_roms(&self) -> Element<'_, Message> {
-        let title = widget::text::title2("Explorador y Copiado de Juegos a la Consola");
-        let desc = widget::text::body(
-            "Selecciona tu consola y marca con las casillas los juegos específicos que deseas copiar directamente a la Anbernic por Wi-Fi.\n\
-            No necesitas sincronizar toda la colección: aquí tienes control juego a juego.",
-        );
-
-        // 1. Selector de Consola mediante botones
-        let mut system_buttons = widget::row::with_capacity(self.systems.len()).spacing(8);
-        for (idx, sys) in self.systems.iter().enumerate() {
-            let btn = if idx == self.selected_system_index {
-                widget::button::suggested(sys.name.as_str())
-            } else {
-                widget::button::standard(sys.name.as_str()).on_press(Message::SelectSystemForGames(idx))
-            };
-            system_buttons = system_buttons.push(btn);
-        }
-
-        let system_scroll = widget::scrollable::horizontal(system_buttons);
-
-        // 2. Información del sistema seleccionado
-        let current_sys = &self.systems[self.selected_system_index];
-        let sys_info_text = format!(
-            "Carpeta en tu PC: {}  ➔  Destino Anbernic: /userdata/{}",
-            current_sys.local_folder_str, current_sys.remote_folder
-        );
-
-        let browse_btn = widget::button::standard("Cambiar carpeta...")
-            .on_press(Message::PickSystemFolder(self.selected_system_index));
-
-        let sys_header_section = settings::section()
-            .title(format!("Consola activa: {}", current_sys.name))
-            .add(
-                settings::item(sys_info_text, browse_btn),
-            );
-
-        // 3. Barra de herramientas para selección y copiado
-        let selected_count = self.games_list.iter().filter(|g| g.selected).count();
-        let total_selected_bytes: u64 = self.games_list.iter().filter(|g| g.selected).map(|g| g.size_bytes).sum();
-
-        let copy_btn = if self.is_copying_games {
-            widget::button::suggested("Copiando juegos por Wi-Fi...").width(Length::Shrink)
-        } else if selected_count == 0 {
-            widget::button::standard("Copiar a la Anbernic (0 seleccionados)").width(Length::Shrink)
-        } else {
-            widget::button::suggested(format!("🚀 Copiar a la Anbernic ({selected_count} seleccionados)"))
-                .on_press(Message::CopySelectedGamesToConsole)
-                .width(Length::Shrink)
-        };
-
-        let select_missing_btn = widget::button::standard("Seleccionar los que faltan")
-            .on_press(Message::SelectAllMissingGames);
-
-        let deselect_btn = widget::button::standard("Deseleccionar todos")
-            .on_press(Message::DeselectAllGames);
-
-        let refresh_btn = widget::button::standard("🔄 Refrescar")
-            .on_press(Message::RefreshGamesList);
-
-        let toolbar = widget::row::with_capacity(5)
-            .push(copy_btn)
-            .push(select_missing_btn)
-            .push(deselect_btn)
-            .push(refresh_btn)
-            .spacing(10);
-
-        // Sección de confirmación previa a la transferencia
-        let confirmation_section: Option<Element<'_, Message>> = if self.show_copy_confirmation {
-            let confirm_btn = widget::button::suggested("✓ Confirmar e Iniciar Copiado")
-                .on_press(Message::ConfirmCopySelectedGames);
-            let cancel_btn = widget::button::standard("✕ Cancelar")
-                .on_press(Message::CancelCopyConfirmation);
-            let btn_row = widget::row::with_capacity(2).push(confirm_btn).push(cancel_btn).spacing(8);
-
-            Some(
-                settings::section()
-                    .title("⚠️ Confirmar Transferencia hacia la Consola")
-                    .add(settings::item(
-                        format!(
-                            "Se transferirán {} juego(s) ({} total) hacia /userdata/{}. ¿Proceder?",
-                            selected_count,
-                            systems::format_size(total_selected_bytes),
-                            current_sys.remote_folder
-                        ),
-                        btn_row,
-                    ))
-                    .into()
-            )
-        } else {
-            None
-        };
-
-        let search_bar = widget::text_input::search_input("Buscar por título de juego...", &self.rom_search_query)
-            .on_input(Message::SearchRoms);
-
-        // 4. Lista de juegos
-        let query_lower = self.rom_search_query.to_lowercase();
-        let filtered_games: Vec<(usize, &systems::GameItem)> = self
-            .games_list
-            .iter()
-            .enumerate()
-            .filter(|(_, g)| {
-                if query_lower.is_empty() {
-                    true
-                } else {
-                    g.filename.to_lowercase().contains(&query_lower)
-                }
-            })
-            .collect();
-
-        let mut games_section = settings::section()
-            .title(format!("Juegos encontrados ({} disponibles)", filtered_games.len()));
-
-        if filtered_games.is_empty() {
-            games_section = games_section.add(
-                settings::item(
-                    "No se encontraron juegos en esta carpeta",
-                    widget::text::caption(
-                        "Copia archivos de juegos en la carpeta local o haz clic en 'Cambiar carpeta' para apuntar a donde guardas tus ROMs.",
-                    ),
-                ),
-            );
-        } else {
-            for (idx, game) in filtered_games {
-                let status_label = if game.exists_on_console {
-                    format!("{}  |  🟢 Ya en la Anbernic", game.size_formatted)
-                } else {
-                    format!("{}  |  📥 Listo para copiar a Anbernic", game.size_formatted)
-                };
-
-                let item = settings::item::builder(game.filename.as_str())
-                    .description(status_label)
-                    .checkbox(game.selected, move |val| Message::ToggleGameSelection(idx, val));
-
-                games_section = games_section.add(item);
-            }
-        }
-
-        let mut content = widget::column::with_capacity(9)
-            .push(title)
-            .push(desc)
-            .push(system_scroll)
-            .push(sys_header_section);
-
-        if let Some(conf) = confirmation_section {
-            content = content.push(conf);
-        }
-
-        content = content
-            .push(toolbar)
-            .push(search_bar)
-            .push(games_section)
-            .spacing(20)
-            .padding(24)
-            .max_width(940);
-
-        widget::container(content)
-            .width(Length::Fill)
-            .align_x(Horizontal::Center)
-            .into()
-    }
-
-    fn view_chd_converter(&self) -> Element<'_, Message> {
-        let title = widget::text::title2("Conversor CHD (CUE/BIN ➔ CHD)");
-        let desc = widget::text::body(
-            "Convierte y comprime imágenes de CD/DVD (PlayStation, Saturn, Sega CD, etc.) \
-            al formato CHD utilizando la herramienta chdman integrada.",
-        );
-
-        let chdman_badge = if let Some(ref ver) = self.chdman_version {
-            widget::container(
-                widget::text::caption(format!("✓ {ver} disponible"))
-            )
-            .padding([4, 8])
-        } else {
-            widget::container(
-                widget::text::caption("⚠ chdman no encontrado en /usr/bin. Instala 'mame-tools'.")
-            )
-            .padding([4, 8])
-        };
-
-        // Sección 1: Archivo individual
-        let cue_input = widget::text_input::text_input("Ruta a tu archivo .cue...", &self.single_cue_path)
-            .on_input(Message::SingleCuePathChanged);
-
-        let browse_cue_btn = widget::button::standard("Examinar .cue...")
-            .on_press(Message::PickSingleCueFile);
-
-        let cue_row = widget::row::with_capacity(2)
-            .push(cue_input)
-            .push(browse_cue_btn)
-            .spacing(8)
-            .width(Length::Fill);
-
-        let out_input = widget::text_input::text_input("Ruta del archivo de salida .chd...", &self.single_output_path)
-            .on_input(Message::SingleOutputPathChanged)
-            .width(Length::Fill);
-
-        let single_convert_btn = if self.is_converting {
-            widget::button::suggested("Convirtiendo...").width(Length::Shrink)
-        } else if self.single_cue_path.trim().is_empty() {
-            widget::button::standard("Convertir a CHD").width(Length::Shrink)
-        } else {
-            widget::button::suggested("Convertir a CHD")
-                .on_press(Message::StartSingleConversion)
-                .width(Length::Shrink)
-        };
-
-        let single_section = settings::section()
-            .title("Conversión de Archivo Individual")
-            .add(
-                settings::item("Archivo CUE de entrada", cue_row),
-            )
-            .add(
-                settings::item("Archivo CHD de salida", out_input),
-            )
-            .add(
-                settings::item("Iniciar conversión", single_convert_btn),
-            );
-
-        // Sección 2: Conversión por lotes
-        let folder_input = widget::text_input::text_input("Ruta de la carpeta con juegos...", &self.batch_folder_path)
-            .on_input(Message::BatchFolderPathChanged);
-
-        let browse_folder_btn = widget::button::standard("Examinar carpeta...")
-            .on_press(Message::PickBatchFolder);
-
-        let scan_folder_btn = widget::button::standard("Buscar .cue")
-            .on_press(Message::ScanFolderCues);
-
-        let folder_row = widget::row::with_capacity(3)
-            .push(folder_input)
-            .push(browse_folder_btn)
-            .push(scan_folder_btn)
-            .spacing(8)
-            .width(Length::Fill);
-
-        let batch_info = format!("{} archivo(s) .cue listado(s)", self.found_cues.len());
-
-        let batch_convert_btn = if self.is_converting {
-            widget::button::suggested("Procesando lote...").width(Length::Shrink)
-        } else if self.found_cues.is_empty() {
-            widget::button::standard("Convertir todos a CHD").width(Length::Shrink)
-        } else {
-            widget::button::suggested(format!("Convertir {} juego(s) a CHD", self.found_cues.len()))
-                .on_press(Message::StartBatchConversion)
-                .width(Length::Shrink)
-        };
-
-        let batch_section = settings::section()
-            .title("Conversión por Lotes (Múltiples Juegos)")
-            .add(
-                settings::item("Carpeta de origen", folder_row),
-            )
-            .add(
-                settings::item("Juegos encontrados", widget::text::body(batch_info)),
-            )
-            .add(
-                settings::item("Procesar lote completo", batch_convert_btn),
-            );
-
-        // Sección 3: Opciones
-        let force_toggler = widget::toggler(self.force_overwrite)
-            .on_toggle(Message::ForceOverwriteToggled);
-
-        let delete_toggler = widget::toggler(self.delete_source_after)
-            .on_toggle(Message::DeleteSourceToggled);
-
-        let options_section = settings::section()
-            .title("Opciones de chdman")
-            .add(
-                settings::item(
-                    "Sobreescribir destino si ya existe (-f / --force)",
-                    force_toggler,
-                ),
-            )
-            .add(
-                settings::item(
-                    "Eliminar archivos .cue y .bin originales tras finalizar",
-                    delete_toggler,
-                ),
-            );
-
-        // Sección 4: Logs
-        let clear_log_btn = widget::button::standard("Limpiar registro")
-            .on_press(Message::ClearLogs);
-
-        let log_header = widget::row::with_capacity(3)
-            .push(widget::text::title3("Registro de Actividad"))
-            .push(cosmic::iced::widget::space::horizontal().width(Length::Fill))
-            .push(clear_log_btn)
-            .align_y(cosmic::iced::alignment::Vertical::Center);
-
-        let log_display = widget::container(
-            widget::scrollable(
-                widget::text(&self.log_output)
-                    .size(13)
-                    .width(Length::Fill),
-            )
-            .height(Length::Fixed(180.0)),
-        )
-        .padding(12)
-        .width(Length::Fill);
-
-        let content = widget::column::with_capacity(8)
-            .push(title)
-            .push(desc)
-            .push(chdman_badge)
-            .push(single_section)
-            .push(batch_section)
-            .push(options_section)
-            .push(log_header)
-            .push(log_display)
-            .spacing(20)
-            .padding(24)
-            .max_width(940);
-
-        widget::container(content)
-            .width(Length::Fill)
-            .align_x(Horizontal::Center)
-            .into()
-    }
-
-    fn view_settings(&self) -> Element<'_, Message> {
-        let title = widget::text::title2("Configuración");
-        let desc = widget::text::body("Parámetros de conexión Wi-Fi (SSH/SFTP), base de datos y carpetas locales.");
-
-        let host_input = widget::text_input::text_input("batocera.local", &self.host_ip)
-            .on_input(Message::HostChanged);
-
-        let port_input = widget::text_input::text_input("22", &self.ssh_port_str)
-            .on_input(Message::PortChanged);
-
-        let user_input = widget::text_input::text_input("root", &self.ssh_user)
-            .on_input(Message::UserChanged);
-
-        let pass_input = widget::text_input::text_input("linux", &self.ssh_password)
-            .on_input(Message::PasswordChanged);
-
-        let folder_input = widget::text_input::text_input("~/Batocera", &self.local_base_dir_str)
-            .on_input(Message::LocalFolderChanged);
-
-        let browse_folder_btn = widget::button::standard("Examinar...")
-            .on_press(Message::PickLocalFolder);
-
-        let folder_row = widget::row::with_capacity(2)
-            .push(folder_input)
-            .push(browse_folder_btn)
-            .spacing(8)
-            .width(Length::Fill);
-
-        let sync_toggler = widget::toggler(self.auto_sync)
-            .on_toggle(Message::AutoSyncToggled);
-
-        let net_section = settings::section()
-            .title("Conexión Wi-Fi / SSH (Anbernic)")
-            .add(
-                settings::item("Dirección IP o Host (ej. batocera.local)", host_input),
-            )
-            .add(
-                settings::item("Puerto SSH", port_input),
-            )
-            .add(
-                settings::item("Usuario SSH (por defecto: root)", user_input),
-            )
-            .add(
-                settings::item("Contraseña SSH (por defecto: linux)", pass_input),
-            );
-
-        let storage_section = settings::section()
-            .title("Almacenamiento Local y Base de Datos")
-            .add(
-                settings::item("Carpeta local de juegos y partidas", folder_row),
-            )
-            .add(
-                settings::item("Base de datos SQLite", widget::text::caption(&self.db_path_str)),
-            )
-            .add(
-                settings::item("Sincronización automática de partidas", sync_toggler),
-            );
-
-        let app_info_section = settings::section()
-            .title("Información de la Aplicación")
-            .add(
-                settings::item("Nombre", widget::text::body("batocera_manager")),
-            )
-            .add(
-                settings::item("Versión", widget::text::body("0.0.1")),
-            )
-            .add(
-                settings::item("Plataforma", widget::text::body("libcosmic / COSMIC Desktop")),
-            );
-
-        let content = widget::column::with_capacity(5)
-            .push(title)
-            .push(desc)
-            .push(net_section)
-            .push(storage_section)
-            .push(app_info_section)
-            .spacing(20)
-            .padding(24)
-            .max_width(940);
-
-        widget::container(content)
-            .width(Length::Fill)
-            .align_x(Horizontal::Center)
-            .into()
-    }
 }
