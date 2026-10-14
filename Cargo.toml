@@ -3,11 +3,22 @@ name = "batocera_manager"
 version = "0.0.1"
 edition = "2024"
 
+[features]
+default = ["gui"]
+gui = ["dep:libcosmic", "dep:open", "dep:rfd", "dep:tokio"]
+
+[[bin]]
+name = "batocera_manager"
+path = "src/main.rs"
+required-features = ["gui"]
+
 [dependencies]
-libcosmic = { git = "https://github.com/pop-os/libcosmic.git", features = ["about"] }
-open = "5.3"
-rfd = "0.15"
-tokio = { version = "1", features = ["rt-multi-thread", "sync", "process"] }
 rusqlite = { version = "0.33", features = ["bundled"] }
 blake3 = "1.5"
 ssh2 = "0.9"
+
+# Solo para la GUI (feature "gui")
+libcosmic = { git = "https://github.com/pop-os/libcosmic.git", features = ["about"], optional = true }
+open = { version = "5.3", optional = true }
+rfd = { version = "0.15", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "process"], optional = true }

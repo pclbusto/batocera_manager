@@ -1,14 +1,8 @@
 mod app;
-mod chd;
-mod db;
-mod diagnostic;
-mod domain;
-mod hash;
-mod net;
-mod services;
-mod sync;
-mod systems;
 mod ui;
+
+// Core compartido: se consume desde la lib en lugar de recompilarlo en el binario.
+use batocera_manager::{chd, db, diagnostic, domain, net, services, sync, systems};
 
 pub use app::{APP_ID, APP_TITLE, BatoceraManagerApp, Message, Page};
 
