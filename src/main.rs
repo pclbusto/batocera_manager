@@ -79,8 +79,6 @@ pub enum Message {
     ScanAndReconcileFinished(Result<db::SyncSummary, String>),
     StartSyncSaves,
     SyncSavesFinished(Result<String, String>),
-    StartSyncRoms,
-    SyncRomsFinished(Result<String, String>),
     FilterCategory(String),
     PickLocalFolder,
     LocalFolderSelected(Option<PathBuf>),
@@ -110,7 +108,11 @@ pub enum Message {
     // Diagnóstico y Limpieza Segura de Residuos
     RunDiagnostic,
     DiagnosticFinished(Result<diagnostic::DiagnosticReport, String>),
-    CleanWasteFiles(Vec<String>),
+    ToggleWasteCandidate(usize, bool),
+    SelectAllWaste(bool),
+    RequestCleanWaste,
+    CancelCleanWaste,
+    ConfirmCleanWaste,
     CleanWasteFinished(Result<usize, String>),
 
     // Conversor CHD
@@ -171,6 +173,7 @@ pub struct BatoceraManagerApp {
     // Diagnóstico
     is_diagnosing: bool,
     latest_diagnostic: Option<diagnostic::DiagnosticReport>,
+    show_waste_confirmation: bool,
 
     // Conversor CHD
     chdman_version: Option<String>,
@@ -357,6 +360,7 @@ impl cosmic::Application for BatoceraManagerApp {
 
             is_diagnosing: false,
             latest_diagnostic: None,
+            show_waste_confirmation: false,
 
             chdman_version: chdman_ver,
             single_cue_path: String::new(),
@@ -778,7 +782,53 @@ impl cosmic::Application for BatoceraManagerApp {
                     }
                 }
             }
-            Message::CleanWasteFiles(paths) => {
+            Message::ToggleWasteCandidate(idx, val) => {
+                if let Some(ref mut diag) = self.latest_diagnostic {
+                    if let Some(candidate) = diag.waste_candidates.get_mut(idx) {
+                        candidate.selected = val;
+                    }
+                }
+            }
+            Message::SelectAllWaste(val) => {
+                if let Some(ref mut diag) = self.latest_diagnostic {
+                    for c in &mut diag.waste_candidates {
+                        c.selected = val;
+                    }
+                }
+            }
+            Message::RequestCleanWaste => {
+                let selected_count = self
+                    .latest_diagnostic
+                    .as_ref()
+                    .map(|d| d.waste_candidates.iter().filter(|w| w.selected).count())
+                    .unwrap_or(0);
+                if selected_count > 0 {
+                    self.show_waste_confirmation = true;
+                } else {
+                    self.log_output.push_str("⚠️ No hay residuos seleccionados para eliminar. Marca los archivos que deseas limpiar.\n");
+                }
+            }
+            Message::CancelCleanWaste => {
+                self.show_waste_confirmation = false;
+            }
+            Message::ConfirmCleanWaste => {
+                self.show_waste_confirmation = false;
+                let paths: Vec<String> = self
+                    .latest_diagnostic
+                    .as_ref()
+                    .map(|d| {
+                        d.waste_candidates
+                            .iter()
+                            .filter(|w| w.selected)
+                            .map(|w| w.full_remote_path.clone())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+
+                if paths.is_empty() {
+                    return Task::none();
+                }
+
                 let config = net::SshConfig {
                     host: self.host_ip.clone(),
                     port: self.ssh_port,
@@ -786,7 +836,7 @@ impl cosmic::Application for BatoceraManagerApp {
                     password: self.ssh_password.clone(),
                 };
                 self.log_output.push_str(&format!(
-                    "\n🧹 Iniciando eliminación segura de {} residuo(s) confirmado(s)...\n",
+                    "\n🧹 Iniciando eliminación segura de {} residuo(s) seleccionado(s) y confirmado(s)...\n",
                     paths.len()
                 ));
 
@@ -808,10 +858,14 @@ impl cosmic::Application for BatoceraManagerApp {
                     Ok(count) => {
                         self.log_output.push_str(&format!("✅ Se eliminaron de forma segura {count} residuo(s).\n"));
                         self.latest_diagnostic = None;
+                        self.show_waste_confirmation = false;
                         self.reload_games_for_selected_system();
                     }
                     Err(e) => {
                         self.log_output.push_str(&format!("⚠️ Resultado de limpieza: {e}\n"));
+                        self.latest_diagnostic = None;
+                        self.show_waste_confirmation = false;
+                        self.reload_games_for_selected_system();
                     }
                 }
             }
@@ -933,45 +987,7 @@ impl cosmic::Application for BatoceraManagerApp {
                     }
                 }
             }
-            Message::StartSyncRoms => {
-                if self.is_syncing {
-                    return Task::none();
-                }
-                self.is_syncing = true;
-                let db_path = self.db_path.clone();
-                let local_base = self.local_base_dir.clone();
-                let config = net::SshConfig {
-                    host: self.host_ip.clone(),
-                    port: self.ssh_port,
-                    user: self.ssh_user.clone(),
-                    password: self.ssh_password.clone(),
-                };
 
-                self.log_output.push_str("\n🎮 Transfiriendo nuevas ROMs hacia la Anbernic...\n");
-
-                return Task::perform(
-                    async move {
-                        tokio::task::spawn_blocking(move || {
-                            sync::sync_roms_to_anbernic(&db_path, &local_base, &config)
-                        })
-                        .await
-                        .unwrap_or_else(|e| Err(format!("Fallo en tarea: {e}")))
-                    },
-                    |res| cosmic::Action::App(Message::SyncRomsFinished(res)),
-                );
-            }
-            Message::SyncRomsFinished(result) => {
-                self.is_syncing = false;
-                match result {
-                    Ok(msg) => {
-                        self.reload_sync_db();
-                        self.log_output.push_str(&format!("✅ {msg}\n"));
-                    }
-                    Err(e) => {
-                        self.log_output.push_str(&format!("❌ Error sincronizando ROMs: {e}\n"));
-                    }
-                }
-            }
             Message::FilterCategory(cat) => {
                 self.selected_category = cat;
                 self.reload_sync_db();
@@ -1410,26 +1426,85 @@ impl BatoceraManagerApp {
         // Sección de residuos si se detectaron
         let waste_section: Option<Element<'_, Message>> = if let Some(ref diag) = self.latest_diagnostic {
             if !diag.waste_candidates.is_empty() {
-                let paths: Vec<String> = diag.waste_candidates.iter().map(|w| w.full_remote_path.clone()).collect();
-                let clean_btn = widget::button::destructive(format!(
-                    "Limpiar {} residuos detectados ({})",
-                    diag.waste_candidates.len(),
-                    systems::format_size(diag.total_waste_bytes)
-                ))
-                .on_press(Message::CleanWasteFiles(paths));
+                let selected_count = diag.waste_candidates.iter().filter(|w| w.selected).count();
+                let selected_bytes: u64 = diag
+                    .waste_candidates
+                    .iter()
+                    .filter(|w| w.selected)
+                    .map(|w| w.size_bytes)
+                    .sum();
 
-                Some(
-                    settings::section()
-                        .title("⚠️ Residuos Detectados en Tarjeta SD (Archivos 0B / .part)")
-                        .add(settings::item(
-                            format!(
-                                "Se detectaron {} archivos de 0 bytes o temporales .part huérfanos. Ninguno ha sido borrado.",
-                                diag.waste_candidates.len()
-                            ),
-                            clean_btn,
-                        ))
-                        .into()
-                )
+                let mut section = settings::section()
+                    .title("⚠️ Residuos Detectados en Tarjeta SD (Archivos 0B / .part)");
+
+                // Diálogo de confirmación explícita previa a la eliminación
+                if self.show_waste_confirmation {
+                    let confirm_btn = widget::button::destructive("✓ Confirmar Eliminación")
+                        .on_press(Message::ConfirmCleanWaste);
+                    let cancel_btn = widget::button::standard("✕ Cancelar")
+                        .on_press(Message::CancelCleanWaste);
+                    let btn_row = widget::row::with_capacity(2)
+                        .push(confirm_btn)
+                        .push(cancel_btn)
+                        .spacing(8);
+
+                    section = section.add(settings::item(
+                        format!(
+                            "¿Confirmas eliminar permanentemente {} archivo(s) seleccionado(s) ({}) de la consola? Esta acción no se puede deshacer.",
+                            selected_count,
+                            systems::format_size(selected_bytes)
+                        ),
+                        btn_row,
+                    ));
+                }
+
+                // Barra de herramientas: seleccionar / deseleccionar y botón de limpieza
+                let select_all_btn = widget::button::standard("Seleccionar todos")
+                    .on_press(Message::SelectAllWaste(true));
+                let deselect_all_btn = widget::button::standard("Deseleccionar todos")
+                    .on_press(Message::SelectAllWaste(false));
+
+                let clean_btn = if selected_count > 0 {
+                    widget::button::destructive(format!(
+                        "Limpiar {} seleccionados ({})",
+                        selected_count,
+                        systems::format_size(selected_bytes)
+                    ))
+                    .on_press(Message::RequestCleanWaste)
+                } else {
+                    widget::button::destructive("Limpiar seleccionados (0)")
+                };
+
+                let toolbar = widget::row::with_capacity(3)
+                    .push(clean_btn)
+                    .push(select_all_btn)
+                    .push(deselect_all_btn)
+                    .spacing(8);
+
+                section = section.add(settings::item(
+                    format!(
+                        "Selecciona individualmente los archivos a eliminar ({} detectados, {} seleccionados):",
+                        diag.waste_candidates.len(),
+                        selected_count
+                    ),
+                    toolbar,
+                ));
+
+                // Lista de candidatos individuales con checkboxes
+                for (idx, w) in diag.waste_candidates.iter().enumerate() {
+                    let desc = format!(
+                        "Consola: {}  |  {}  |  {}",
+                        w.system_id,
+                        w.waste_type.description(),
+                        systems::format_size(w.size_bytes)
+                    );
+                    let item = settings::item::builder(w.relative_path.as_str())
+                        .description(desc)
+                        .checkbox(w.selected, move |val| Message::ToggleWasteCandidate(idx, val));
+                    section = section.add(item);
+                }
+
+                Some(section.into())
             } else {
                 None
             }

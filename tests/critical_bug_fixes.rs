@@ -458,21 +458,30 @@ fn test_09_fallo_dentro_de_lote_detiene_y_preserva_validos() {
 /// Resultado esperado: generar reporte y no borrar nada sin confirmación explícita.
 #[test]
 fn test_10_limpieza_segura_diagnostico_y_confirmacion() {
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
     // Simular colección de archivos encontrados en la consola
     let items = vec![
         WasteCandidate {
             relative_path: "corrupted_game.md".to_string(),
             full_remote_path: "/userdata/roms/megadrive/corrupted_game.md".to_string(),
             size_bytes: 0,
+            mtime: now - 300,
             waste_type: WasteType::ZeroByteRom,
             system_id: "megadrive".to_string(),
+            selected: false,
         },
         WasteCandidate {
             relative_path: "incomplete_transfer.bin.part".to_string(),
             full_remote_path: "/userdata/roms/megadrive/incomplete_transfer.bin.part".to_string(),
             size_bytes: 4096,
+            mtime: now - 300,
             waste_type: WasteType::PartialTransferPart,
             system_id: "megadrive".to_string(),
+            selected: false,
         },
     ];
 
@@ -488,26 +497,124 @@ fn test_10_limpieza_segura_diagnostico_y_confirmacion() {
         report_text: "Informe generado".to_string(),
     };
 
-    // 1. El diagnóstico NO elimina nada
+    // 1. El diagnóstico NO elimina nada y la selección inicial siempre es false
     assert_eq!(report.waste_candidates.len(), 2);
+    assert!(!report.waste_candidates[0].selected);
+    assert!(!report.waste_candidates[1].selected);
 
-    // 2. Comprobar que archivos legítimos y áreas protegidas no se tocan
-    let safe_to_delete = vec![
-        "/userdata/roms/megadrive/corrupted_game.md".to_string(),
-        "/userdata/roms/megadrive/incomplete_transfer.bin.part".to_string(),
-    ];
+    // 2. Validación de reglas de seguridad para eliminación
+    // Candidato 0-byte válido con extensión de ROM
+    assert!(diagnostic::validate_waste_candidate_for_deletion(
+        "/userdata/roms/megadrive/corrupted_game.md",
+        0,
+        now - 300,
+        now
+    ).is_ok());
 
-    // Intentar incluir una ruta fuera de roms (ej: saves o bios)
-    let unsafe_path = "/userdata/saves/megadrive/game.srm".to_string();
+    // Candidato .part antiguo (>120s) es aceptado
+    assert!(diagnostic::validate_waste_candidate_for_deletion(
+        "/userdata/roms/megadrive/incomplete_transfer.bin.part",
+        4096,
+        now - 300,
+        now
+    ).is_ok());
 
-    // Verificación de reglas de seguridad
-    for path in &safe_to_delete {
-        assert!(path.starts_with("/userdata/roms/"));
-        assert!(!path.contains(".."));
-    }
+    // Candidato .part reciente (<120s) debe ser RECHAZADO por riesgo de transferencia activa
+    assert!(diagnostic::validate_waste_candidate_for_deletion(
+        "/userdata/roms/megadrive/active_transfer.bin.part",
+        4096,
+        now - 30, // modificado hace 30 segundos
+        now
+    ).is_err());
 
+    // Archivo de 0 bytes oculto (.nomedia, .keep) debe ser RECHAZADO
+    assert!(diagnostic::validate_waste_candidate_for_deletion(
+        "/userdata/roms/megadrive/.nomedia",
+        0,
+        now - 300,
+        now
+    ).is_err());
+
+    // Archivo con contenido (>0 bytes) que no es .part debe ser RECHAZADO
+    assert!(diagnostic::validate_waste_candidate_for_deletion(
+        "/userdata/roms/megadrive/valid_rom.md",
+        1024 * 1024,
+        now - 300,
+        now
+    ).is_err());
+
+    // Rutas protegidas fuera de roms deben ser RECHAZADAS
+    assert!(diagnostic::validate_waste_candidate_for_deletion(
+        "/userdata/saves/megadrive/game.srm",
+        0,
+        now - 300,
+        now
+    ).is_err());
+    assert!(diagnostic::validate_waste_candidate_for_deletion(
+        "/userdata/bios/scph1001.bin",
+        0,
+        now - 300,
+        now
+    ).is_err());
+}
+
+/// PRUEBA 11 — Rollback seguro en reemplazo atómico
+/// Si el renombrado del temporal al destino definitivo falla al sobrescribir un juego existente,
+/// el archivo original intacto DEBE ser restaurado de inmediato y preservado sin daños ni truncado.
+#[test]
+fn test_11_rollback_seguro_en_reemplazo_atomico() {
+    let env = TestEnv::new("p11_rollback");
+    let local_file = env.create_file("Sonic_v2.md", b"CONTENIDO NUEVO ACTUALIZADO 2.0");
+
+    let storage = MockStorage::default();
+    let remote_dest = "/userdata/roms/megadrive/Sonic.md";
+
+    // 1. Simular un archivo válido existente previamente en la consola
+    let original_bytes = b"CONTENIDO ORIGINAL VALIOSO E INTACTO 1.0".to_vec();
+    storage.files.lock().unwrap().insert(remote_dest.to_string(), original_bytes.clone());
+
+    // 2. CASO A: Reemplazo exitoso con allow_overwrite = true
+    let res = upload_transactional(&storage, &local_file, remote_dest, 0, true);
+    assert!(res.is_ok(), "El reemplazo autorizado debió completarse con éxito");
+
+    let files_after_ok = storage.files.lock().unwrap();
+    assert_eq!(
+        files_after_ok.get(remote_dest).unwrap(),
+        b"CONTENIDO NUEVO ACTUALIZADO 2.0",
+        "El destino debe tener el nuevo contenido"
+    );
+    // Verificar que el backup temporal fue limpiado tras el éxito
     assert!(
-        !unsafe_path.starts_with("/userdata/roms/"),
-        "Las rutas de partidas protegidas deben ser rechazadas"
+        !files_after_ok.keys().any(|k| k.contains("bm_backup")),
+        "No deben quedar archivos temporales de respaldo tras éxito"
+    );
+    drop(files_after_ok);
+
+    // 3. CASO B: Reemplazo con fallo simulado en rename (Simulación de caída de red/error SFTP)
+    // Restauramos el contenido original y activamos la bandera de error en rename
+    storage.files.lock().unwrap().insert(remote_dest.to_string(), original_bytes.clone());
+    *storage.fail_rename.lock().unwrap() = true;
+
+    let res_fail = upload_transactional(&storage, &local_file, remote_dest, 0, true);
+    assert!(res_fail.is_err(), "La operación debió fallar por el error en rename simulado");
+
+    let files_after_fail = storage.files.lock().unwrap();
+    // ¡REGLA DE ORO DE INTEGRIDAD!: El archivo original NUNCA desaparece ni se trunca
+    assert!(
+        files_after_fail.contains_key(remote_dest),
+        "El archivo de destino debe seguir existiendo tras el rollback"
+    );
+    assert_eq!(
+        files_after_fail.get(remote_dest).unwrap(),
+        &original_bytes,
+        "El contenido del archivo original debe haber sido restaurado exactamente intacto por el rollback"
+    );
+
+    // El archivo .part temporal debió haber sido eliminado por la limpieza de error
+    let part_path = format!("{remote_dest}.part");
+    assert!(
+        !files_after_fail.contains_key(&part_path),
+        "El archivo .part debe ser limpiado tras fallo"
     );
 }
+

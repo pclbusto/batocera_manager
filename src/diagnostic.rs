@@ -18,13 +18,15 @@ impl WasteType {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WasteCandidate {
     pub relative_path: String,
     pub full_remote_path: String,
     pub size_bytes: u64,
+    pub mtime: u64,
     pub waste_type: WasteType,
     pub system_id: String,
+    pub selected: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -47,6 +49,73 @@ pub struct DiagnosticReport {
     pub report_text: String,
 }
 
+/// Valida si una ruta y sus metadatos califican de forma segura para eliminación de residuos.
+/// Rechaza cualquier ruta que:
+/// - No esté estrictamente en /userdata/roms/
+/// - Contenga '..'
+/// - Apunte a saves, bios o system
+/// - Sea un temporal .part modificado hace menos de 120 segundos (posible transferencia en progreso)
+/// - Sea un archivo no vacío que no sea .part
+/// - Sea un archivo oculto del sistema (.nomedia, .keep, .gitkeep)
+/// - Sea un archivo de 0 bytes con una extensión que no corresponde a ROMs conocidas
+pub fn validate_waste_candidate_for_deletion(
+    remote_path: &str,
+    size: u64,
+    mtime: u64,
+    now: u64,
+) -> Result<(), &'static str> {
+    if !remote_path.starts_with("/userdata/roms/") {
+        return Err("Ruta no pertenece a /userdata/roms/");
+    }
+    if remote_path.contains("..") {
+        return Err("Ruta contiene componentes relativos no permitidos");
+    }
+    if remote_path.starts_with("/userdata/saves")
+        || remote_path.starts_with("/userdata/bios")
+        || remote_path.starts_with("/userdata/system")
+    {
+        return Err("Intento de eliminar archivo en directorio protegido");
+    }
+
+    let is_part = remote_path.ends_with(".part") || remote_path.contains(".part.");
+    if is_part {
+        if now.saturating_sub(mtime) < 120 {
+            return Err("Archivo temporal .part modificado recientemente (posible transferencia activa)");
+        }
+        return Ok(());
+    }
+
+    if size != 0 {
+        return Err("El archivo no tiene 0 bytes ni es un temporal .part");
+    }
+
+    let filename = Path::new(remote_path)
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or("");
+    if filename.starts_with('.') {
+        return Err("Archivo oculto de sistema protegido contra eliminación");
+    }
+
+    let is_rom_extension = if let Some(ext) = Path::new(filename).extension().and_then(|e| e.to_str()) {
+        let ext_lower = ext.to_lowercase();
+        matches!(
+            ext_lower.as_str(),
+            "md" | "bin" | "gen" | "smd" | "zip" | "7z" | "iso" | "cue" | "chd"
+                | "nes" | "smc" | "sfc" | "gba" | "gbc" | "gb" | "pce" | "rom"
+                | "z64" | "n64" | "v64" | "gcm" | "cso" | "wbfs" | "rvz"
+        )
+    } else {
+        false
+    };
+
+    if !is_rom_extension {
+        return Err("Extensión no corresponde a un formato ROM reconocido");
+    }
+
+    Ok(())
+}
+
 /// Ejecuta un diagnóstico exhaustivo y NO destructivo de almacenamiento sobre los directorios ROM en la consola.
 /// NUNCA modifica, crea ni elimina ningún archivo durante el análisis.
 pub fn run_storage_diagnostic(
@@ -54,6 +123,11 @@ pub fn run_storage_diagnostic(
     sftp: &Sftp,
     systems: &[SystemConfig],
 ) -> Result<DiagnosticReport, String> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
     // 1. Consultar espacio libre y total real en el sistema de archivos /userdata
     let disk_space = net::get_remote_disk_space(sess, "/userdata").ok();
 
@@ -89,14 +163,20 @@ pub fn run_storage_diagnostic(
 
             // Detectar archivos temporales .part
             if filename.ends_with(".part") || filename.contains(".part.") {
+                // Verificar frescura: si fue modificado en los últimos 120s, omitir por posible transferencia activa
+                if now.saturating_sub(item.mtime) < 120 {
+                    continue;
+                }
                 sys_parts += 1;
                 total_waste_bytes += item.size;
                 waste_candidates.push(WasteCandidate {
                     relative_path: item.relative_path.clone(),
                     full_remote_path: full_path,
                     size_bytes: item.size,
+                    mtime: item.mtime,
                     waste_type: WasteType::PartialTransferPart,
                     system_id: sys.id.clone(),
+                    selected: false,
                 });
             }
             // Detectar archivos de 0 bytes, distinguiendo legítimos de residuos
@@ -104,16 +184,31 @@ pub fn run_storage_diagnostic(
                 // Distinción de archivos vacíos legítimos de sistema (.nomedia, .keep, .gitkeep)
                 let is_legitimate_empty = filename.starts_with('.')
                     || filename.eq_ignore_ascii_case(".nomedia")
-                    || filename.eq_ignore_ascii_case(".keep");
+                    || filename.eq_ignore_ascii_case(".keep")
+                    || filename.eq_ignore_ascii_case(".gitkeep");
 
-                if !is_legitimate_empty {
+                let is_rom_extension = if let Some(ext) = Path::new(&filename).extension().and_then(|e| e.to_str()) {
+                    let ext_lower = ext.to_lowercase();
+                    matches!(
+                        ext_lower.as_str(),
+                        "md" | "bin" | "gen" | "smd" | "zip" | "7z" | "iso" | "cue" | "chd"
+                            | "nes" | "smc" | "sfc" | "gba" | "gbc" | "gb" | "pce" | "rom"
+                            | "z64" | "n64" | "v64" | "gcm" | "cso" | "wbfs" | "rvz"
+                    )
+                } else {
+                    false
+                };
+
+                if !is_legitimate_empty && is_rom_extension {
                     sys_zero_bytes += 1;
                     waste_candidates.push(WasteCandidate {
                         relative_path: item.relative_path.clone(),
                         full_remote_path: full_path,
                         size_bytes: 0,
+                        mtime: item.mtime,
                         waste_type: WasteType::ZeroByteRom,
                         system_id: sys.id.clone(),
+                        selected: false,
                     });
                 }
             }
@@ -202,40 +297,22 @@ pub fn run_storage_diagnostic(
 pub fn clean_confirmed_waste(sftp: &Sftp, paths_to_delete: &[String]) -> Result<usize, String> {
     let mut deleted_count = 0;
     let mut errors = Vec::new();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
 
     for remote_path in paths_to_delete {
         let p = Path::new(remote_path);
 
-        // Seguridad 1: Debe comenzar con /userdata/roms/
-        if !remote_path.starts_with("/userdata/roms/") {
-            errors.push(format!("Rechazado por seguridad: '{remote_path}' no está en /userdata/roms/"));
-            continue;
-        }
-
-        // Seguridad 2: No debe contener navegación relativa
-        if remote_path.contains("..") {
-            errors.push(format!("Rechazado por seguridad: ruta inválida '{remote_path}'"));
-            continue;
-        }
-
-        // Seguridad 3: Prohibido tocar saves, bios o configuraciones
-        if remote_path.starts_with("/userdata/saves")
-            || remote_path.starts_with("/userdata/bios")
-            || remote_path.starts_with("/userdata/system")
-        {
-            errors.push(format!("Prohibido: intento de eliminar archivo protegido en '{remote_path}'"));
-            continue;
-        }
-
-        // Seguridad 4: Verificar en el servidor remoto que realmente sea 0 bytes o .part
+        // Consultar atributos en el servidor remoto
         match sftp.stat(p) {
             Ok(stat) => {
                 let size = stat.size.unwrap_or(0);
-                let is_part = remote_path.ends_with(".part") || remote_path.contains(".part.");
-                if size != 0 && !is_part {
-                    errors.push(format!(
-                        "Rechazado: '{remote_path}' no es de 0 bytes ({size} bytes) ni temporal .part"
-                    ));
+                let mtime = stat.mtime.unwrap_or(0);
+
+                if let Err(reason) = validate_waste_candidate_for_deletion(remote_path, size, mtime, now) {
+                    errors.push(format!("Rechazado '{remote_path}': {reason}"));
                     continue;
                 }
 

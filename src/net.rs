@@ -304,10 +304,45 @@ impl<'a> StorageBackend for SftpStorage<'a> {
     }
 
     fn rename_atomic(&self, src: &str, dst: &str) -> Result<(), String> {
-        let _ = self.sftp.unlink(Path::new(dst));
-        self.sftp
-            .rename(Path::new(src), Path::new(dst), None)
-            .map_err(|e| format!("Error al renombrar archivo temporal a definitivo: {e}"))
+        let dst_path = Path::new(dst);
+        let src_path = Path::new(src);
+
+        // Si el archivo de destino existe previamente, realizamos un reemplazo seguro con respaldo y rollback:
+        if self.sftp.stat(dst_path).is_ok() {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let backup_path_str = format!("{dst}.bm_backup_{ts}");
+            let backup_path = Path::new(&backup_path_str);
+
+            // 1. Mover el destino existente al backup temporal (resguardo seguro previo)
+            let _ = self.sftp.unlink(backup_path);
+            self.sftp
+                .rename(dst_path, backup_path, None)
+                .map_err(|e| format!("No se pudo resguardar archivo existente antes del reemplazo: {e}"))?;
+
+            // 2. Mover el nuevo archivo .part al destino definitivo
+            match self.sftp.rename(src_path, dst_path, None) {
+                Ok(()) => {
+                    // ÉXITO: El nuevo archivo fue publicado correctamente.
+                    // Eliminamos el respaldo temporal ahora que la publicación se completó.
+                    let _ = self.sftp.unlink(backup_path);
+                    Ok(())
+                }
+                Err(e) => {
+                    // FALLO: ROLLBACK OBLIGATORIO.
+                    // Restauramos de inmediato el archivo original intacto.
+                    let _ = self.sftp.rename(backup_path, dst_path, None);
+                    Err(format!("Fallo al publicar el archivo temporal en destino. Se restauró el original intacto: {e}"))
+                }
+            }
+        } else {
+            // El destino no existía: renombrado directo
+            self.sftp
+                .rename(src_path, dst_path, None)
+                .map_err(|e| format!("Error al renombrar archivo temporal a definitivo: {e}"))
+        }
     }
 
     fn unlink(&self, path: &str) -> Result<(), String> {
@@ -469,6 +504,7 @@ pub mod mock {
         pub unlink_log: Arc<Mutex<Vec<String>>>,
         pub rename_log: Arc<Mutex<Vec<(String, String)>>>,
         pub created_temp_log: Arc<Mutex<Vec<String>>>,
+        pub fail_rename: Arc<Mutex<bool>>,
     }
 
     struct MockWriter {
@@ -541,11 +577,38 @@ pub mod mock {
         fn rename_atomic(&self, src: &str, dst: &str) -> Result<(), String> {
             self.rename_log.lock().unwrap().push((src.to_string(), dst.to_string()));
             let mut files = self.files.lock().unwrap();
-            if let Some(content) = files.remove(src) {
-                files.insert(dst.to_string(), content);
-                Ok(())
+            if files.contains_key(dst) {
+                // Simulación idéntica al backend real: resguardo previo con rollback si falla
+                let backup_key = format!("{dst}.bm_backup_mock");
+                let old_dst = files.remove(dst).unwrap();
+                files.insert(backup_key.clone(), old_dst);
+
+                if *self.fail_rename.lock().unwrap() {
+                    // Rollback restaurando archivo existente intacto
+                    let backup = files.remove(&backup_key).unwrap();
+                    files.insert(dst.to_string(), backup);
+                    return Err("Fallo simulado en rename hacia destino. Se restauró el original intacto.".to_string());
+                }
+
+                if let Some(content) = files.remove(src) {
+                    files.insert(dst.to_string(), content);
+                    files.remove(&backup_key);
+                    Ok(())
+                } else {
+                    let backup = files.remove(&backup_key).unwrap();
+                    files.insert(dst.to_string(), backup);
+                    Err(format!("No se encontró temporal '{src}' para renombrar"))
+                }
             } else {
-                Err(format!("No se encontró temporal '{src}' para renombrar"))
+                if *self.fail_rename.lock().unwrap() {
+                    return Err("Fallo simulado en rename".to_string());
+                }
+                if let Some(content) = files.remove(src) {
+                    files.insert(dst.to_string(), content);
+                    Ok(())
+                } else {
+                    Err(format!("No se encontró temporal '{src}' para renombrar"))
+                }
             }
         }
 
